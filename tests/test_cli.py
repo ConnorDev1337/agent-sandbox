@@ -1,0 +1,126 @@
+import json
+import subprocess
+
+import pytest
+
+from agent_sandbox import cli
+from agent_sandbox.canary import load_registry
+from agent_sandbox.config import load
+
+
+class FakeDocker:
+    """Records docker invocations and returns scripted results."""
+
+    def __init__(self):
+        self.calls = []
+        self.stdout = ""
+        self.returncode = 0
+
+    def __call__(self, command, check=True, text=True, capture_output=False, **kwargs):
+        self.calls.append(command)
+        if check and self.returncode:
+            raise subprocess.CalledProcessError(self.returncode, command, stderr="boom")
+        return subprocess.CompletedProcess(command, self.returncode, self.stdout, "")
+
+
+@pytest.fixture
+def docker(monkeypatch):
+    fake = FakeDocker()
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(cli.subprocess, "run", fake)
+    return fake
+
+
+def run(capsys, workspace, *argv):
+    code = cli.main(["-w", str(workspace), *argv])
+    out = capsys.readouterr()
+    return code, out.out, out.err
+
+
+def test_init_creates_state_and_keeps_canaries(capsys, workspace):
+    code, out, _ = run(capsys, workspace, "init", "--write-config")
+    assert code == 0 and "canaries   7" in out
+    config = load(workspace)
+    first = load_registry(config.canary_file)
+    assert (workspace / ".agent-sandbox.toml").exists()
+    run(capsys, workspace, "init")
+    assert load_registry(config.canary_file) == first
+    run(capsys, workspace, "init", "--rotate")
+    assert load_registry(config.canary_file) != first
+
+
+def test_up_down_and_exec_commands(capsys, workspace, docker):
+    assert run(capsys, workspace, "up", "--build")[0] == 0
+    up = docker.calls[-1]
+    assert up[1:3] == ["compose", "-p"] and up[-4:] == ["up", "--build", "-d", "--wait"]
+    assert run(capsys, workspace, "run", "--", "python3", "-V")[0] == 0
+    assert docker.calls[-1][-5:] == ["exec", "-T", "agent", "python3", "-V"]
+    assert run(capsys, workspace, "shell")[0] == 0
+    assert docker.calls[-1][-2:] == ["bash", "-l"]
+    assert run(capsys, workspace, "down", "--volumes")[0] == 0
+    assert docker.calls[-1][-2:] == ["down", "--volumes"]
+    assert run(capsys, workspace, "run")[0] == 2
+
+
+def test_status_and_alerts(capsys, workspace, docker):
+    config = load(workspace)
+    assert "not initialized" in run(capsys, workspace, "status")[1]
+    run(capsys, workspace, "init")
+    alert = {"ts": "2026-01-01T00:00:00Z", "kind": "canary.exfiltration", "severity": "critical",
+             "message": "canary aws (plain) found in request body"}  # fmt: skip
+    (config.log_dir / "alerts.jsonl").write_text(
+        json.dumps(alert) + "\nnot json\n", encoding="utf-8"
+    )
+    (config.log_dir / "events.jsonl").write_text(
+        json.dumps({"ts": "t", "kind": "egress.denied", "host": "evil.example", "port": 443})
+        + "\n",
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, workspace, "status")
+    assert "1 critical" in out
+    code, out, _ = run(capsys, workspace, "alerts", "--fail")
+    assert code == 1 and "canary.exfiltration" in out
+    code, out, _ = run(capsys, workspace, "alerts", "--events")
+    assert "host=evil.example" in out
+    code, out, _ = run(capsys, workspace, "alerts", "--json")
+    assert json.loads(out.splitlines()[0])["severity"] == "critical"
+
+
+def test_verify_reports_checks_and_expected_alerts(capsys, workspace, docker, monkeypatch):
+    config = load(workspace)
+    config.log_dir.mkdir(parents=True)
+    docker.stdout = "\n".join(
+        json.dumps({"check": name, "ok": True, "detail": "ok"}) for name in ("a", "b")
+    )
+    alerts = [
+        {"ts": "9999-01-01T00:00:00Z", "kind": kind, "severity": "critical"}
+        for kind in cli.EXPECTED_ALERTS
+    ]
+    (config.log_dir / "alerts.jsonl").write_text(
+        "\n".join(json.dumps(a) for a in alerts) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    code, out, _ = run(capsys, workspace, "verify")
+    assert code == 0 and "5/5 checks passed" in out
+    (config.log_dir / "alerts.jsonl").write_text("", encoding="utf-8")
+    code, out, _ = run(capsys, workspace, "verify", "--no-up")
+    assert code == 1 and "FAIL  gateway raised a canary.dns alert" in out
+    docker.stdout = ""
+    assert run(capsys, workspace, "verify", "--no-up")[0] == 2
+
+
+def test_errors(capsys, workspace, docker, monkeypatch):
+    docker.returncode = 1
+    code, _, err = run(capsys, workspace, "up")
+    assert code == 2 and "boom" in err
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    code, _, err = run(capsys, workspace, "up")
+    assert code == 2 and "docker was not found" in err
+    (workspace / ".agent-sandbox.toml").write_text("[nope]\n", encoding="utf-8")
+    assert run(capsys, workspace, "config")[0] == 2
+
+
+def test_config_and_help(capsys, workspace):
+    code, out, _ = run(capsys, workspace, "config")
+    assert code == 0 and json.loads(out)["gateway_ip"] == "172.31.250.2"
+    assert cli.main([]) == 2
