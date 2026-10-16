@@ -67,28 +67,42 @@ class Tripwire(threading.Thread):
         self.files = files
         self.log = log
         self._last: dict[Path, float] = {}
+        self._fd: int | None = None
+        self._watches: dict[int, tuple[Path, Canary]] = {}
 
-    def run(self) -> None:
+    def arm(self) -> bool:
+        """Install the inotify watches; return False if inotify is unavailable.
+
+        Called before the gateway reports healthy, so the agent cannot read a
+        canary before it is watched.
+        """
         libc_name = ctypes.util.find_library("c")
         libc = ctypes.CDLL(libc_name, use_errno=True) if libc_name else None
         if libc is None or not hasattr(libc, "inotify_init1"):
             self.log.event("tripwire.unavailable", reason="inotify not supported")
-            return
+            return False
         fd = libc.inotify_init1(IN_CLOEXEC)
         if fd < 0:
             self.log.event("tripwire.unavailable", reason=os.strerror(ctypes.get_errno()))
-            return
-        watches = {}
+            return False
         for path, canary in self.files.items():
             wd = libc.inotify_add_watch(fd, os.fsencode(path), IN_OPEN | IN_ACCESS)
             if wd >= 0:
-                watches[wd] = (path, canary)
-        self.log.event("tripwire.armed", files=len(watches))
+                self._watches[wd] = (path, canary)
+        self._fd = fd
+        self.log.event("tripwire.armed", files=len(self._watches))
+        return True
+
+    def run(self) -> None:
+        if self._fd is None:
+            self.arm()
+        if self._fd is None:
+            return
         while True:
-            buffer = os.read(fd, 64 * 1024)
+            buffer = os.read(self._fd, 64 * 1024)
             for wd, _mask in parse_events(buffer):
-                if wd in watches:
-                    self.triggered(*watches[wd])
+                if wd in self._watches:
+                    self.triggered(*self._watches[wd])
 
     def triggered(self, path: Path, canary: Canary) -> None:
         now = time.monotonic()

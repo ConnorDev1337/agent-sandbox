@@ -312,8 +312,9 @@ def test_tripwire_detects_reads(tmp_path, canaries, log):
     import time
 
     paths = seed(tmp_path / "home", canaries[:1], 1000, 1000)
-    Tripwire({paths[0]: canaries[0]}, log).start()
-    time.sleep(0.3)
+    wire = Tripwire({paths[0]: canaries[0]}, log)
+    assert wire.arm(), read_jsonl(log.directory / "events.jsonl")
+    wire.start()
     paths[0].read_text(encoding="utf-8")
     for _ in range(50):
         if (log.directory / "alerts.jsonl").exists():
