@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+report.xml
+htmlcov/
+
+# Per-project sandbox state (canary registry, logs, generated compose file)
+.agent-sandbox/
+
+# Local demo workspace used for manual end-to-end runs
+.demo-workspace/
+.verify.log
