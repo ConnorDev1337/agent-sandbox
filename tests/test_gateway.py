@@ -295,10 +295,11 @@ def _restricted(port, *rules):
     return [{"host": target, **rule} for rule in rules] or [target]
 
 
-def test_restricted_plaintext_tunnel_relays_requests(harness, keepalive_upstream, log):
+@pytest.mark.parametrize("max_body", [10 * 1024 * 1024, 1024], ids=["held", "streamed"])
+def test_restricted_plaintext_tunnel_relays_requests(harness, keepalive_upstream, log, max_body):
     port = keepalive_upstream
-    h = harness(_restricted(port, {"methods": ["GET", "POST"]}))
-    big = b"x" * 200_000
+    h = harness(_restricted(port, {"methods": ["GET", "POST"]}), max_body=max_body)
+    big = bytes(range(256)) * 800
     requests = (
         f"GET /one HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
         f"POST /two HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {len(big)}\r\n"
@@ -581,3 +582,18 @@ def test_dns_alerts_are_debounced(canaries, log):
         packet = struct.pack("!HHHHHH", 1, 0x0100, 1, 0, 0, 0) + labels + b"\0"
         protocol.datagram_received(packet + struct.pack("!HH", qtype, 1), ("1.2.3.4", 1))
     assert len(read_jsonl(log.directory / "alerts.jsonl")) == 1
+
+
+def test_large_streamed_body_never_releases_a_late_canary(harness, upstream, canaries, log):
+    secret = next(c for c in canaries if c.kind == "dotenv").secrets[1].encode()
+    target = f"127.0.0.1:{upstream}"
+    h = harness(_restricted(upstream, {"methods": ["POST"]}), max_body=1024)
+    body = b"y" * 100_000 + secret + b"z" * 10
+    request = (
+        f"POST /x HTTP/1.1\r\nHost: {target}\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+    response = h.raw(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(), read_after=request)
+    assert response.startswith(b"HTTP/1.1 403")
+    assert read_jsonl(log.directory / "alerts.jsonl")[0]["where"] == "request body"
+    assert all(secret[:12] not in r[2] for r in Upstream.received)
