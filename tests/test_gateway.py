@@ -6,6 +6,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
@@ -16,7 +17,7 @@ from agent_sandbox.canary import CanaryMatcher, generate
 from agent_sandbox.gateway import dns
 from agent_sandbox.gateway.alerts import EventLog
 from agent_sandbox.gateway.proxy import Proxy, parse_head, split_host_port
-from agent_sandbox.gateway.tls import server_name
+from agent_sandbox.gateway.tls import MAX_HELLO, hello_complete, server_name
 from agent_sandbox.gateway.tripwire import Tripwire, parse_events, seed
 
 
@@ -241,6 +242,40 @@ def test_sni_parsing_and_mismatch(harness, upstream, log):
         f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode(),
         read_after=_client_hello("evil.example"),
     )
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["kind"] == "egress.sni_mismatch" and alert["sni"] == "evil.example"
+
+
+def _fragmented_hello(sni: str, size: int = 20) -> bytes:
+    """The same ClientHello split over several TLS records of ``size`` bytes."""
+    handshake = _client_hello(sni)[5:]
+    return b"".join(
+        b"\x16\x03\x01" + struct.pack("!H", len(part)) + part
+        for part in (handshake[i : i + size] for i in range(0, len(handshake), size))
+    )
+
+
+def test_hello_reassembly():
+    hello = _fragmented_hello("pypi.org")
+    assert server_name(hello) == "pypi.org"
+    assert not hello_complete(hello[:30]) and hello_complete(hello)
+    assert hello_complete(b"\x16\x03\x01\x00\x01\x01" + b"\x17\x03\x03\x00\x00")  # not handshake
+    assert hello_complete(b"\x16\x03\x01\xff\xff" + b"\0" * MAX_HELLO)
+    assert server_name(_fragmented_hello("pypi.org")[:-3]) is None
+
+
+def test_sni_check_survives_split_hello(harness, upstream, log):
+    h = harness([f"127.0.0.1:{upstream}"])
+    hello = _fragmented_hello("evil.example", size=7)
+    with socket.create_connection(("127.0.0.1", h.port), timeout=5) as sock:
+        sock.sendall(f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode())
+        assert sock.recv(4096).startswith(b"HTTP/1.1 200")
+        sock.sendall(hello[:9])
+        time.sleep(0.2)
+        sock.sendall(hello[9:])
+        with contextlib.suppress(OSError):
+            while sock.recv(4096):
+                pass
     (alert,) = read_jsonl(log.directory / "alerts.jsonl")
     assert alert["kind"] == "egress.sni_mismatch" and alert["sni"] == "evil.example"
 
