@@ -1,0 +1,23 @@
+# Example .agent-sandbox.toml for running Claude Code inside the sandbox.
+# Copy it to the root of your project as .agent-sandbox.toml.
+
+[network]
+# The defaults (PyPI, npm, GitHub) stay allowed; add the Anthropic API.
+allow = ["api.anthropic.com"]
+
+[resources]
+cpus = 4
+memory = "6g"
+
+[env]
+# Forwarded from your shell. Anything forwarded is reachable by the agent and
+# can be sent to an allowlisted host, so forward only what the agent needs.
+pass = ["ANTHROPIC_API_KEY"]
+
+[env.set]
+# Skip telemetry and other traffic the agent does not need.
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+
+[alerts]
+# Optional: receive critical alerts in Slack or any JSON webhook.
+# webhook = "https://hooks.slack.com/services/..."

@@ -41,6 +41,8 @@ markers = ["docker: end-to-end tests that build and run containers (need a Docke
 [tool.coverage.run]
 source = ["agent_sandbox"]
 branch = true
+# Run inside the containers; exercised by `agent-sandbox verify` (end-to-end job).
+omit = ["*/agent_sandbox/selftest.py", "*/agent_sandbox/gateway/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
