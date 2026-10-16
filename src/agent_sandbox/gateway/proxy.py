@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from ..allowlist import Allowlist, normalize_host
 from ..canary import CanaryHit, CanaryMatcher
 from .alerts import EventLog
-from .tls import looks_like_tls, server_name
+from .tls import hello_complete, looks_like_tls, server_name
 
 MAX_HEAD = 64 * 1024
 CHUNK = 64 * 1024
@@ -258,6 +258,7 @@ class Proxy:
 
         first = await asyncio.wait_for(reader.read(CHUNK), self.idle_timeout)
         if looks_like_tls(first):
+            first = await self._read_hello(reader, first)
             sni = server_name(first)
             if sni is not None and sni != host:
                 self.log.alert(
@@ -283,6 +284,16 @@ class Proxy:
             )
         finally:
             upstream_writer.close()
+
+    async def _read_hello(self, reader: asyncio.StreamReader, first: bytes) -> bytes:
+        """Buffer the whole ClientHello so a fragmented one cannot hide its SNI."""
+        data = first
+        while not hello_complete(data):
+            chunk = await asyncio.wait_for(reader.read(CHUNK), self.idle_timeout)
+            if not chunk:
+                break
+            data += chunk
+        return data
 
     async def _pump(
         self,
