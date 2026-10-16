@@ -5,9 +5,10 @@ out. Every request is checked against the allowlist, and every byte the agent
 sends that the gateway can read (request lines, headers, plain-HTTP bodies,
 non-TLS tunnels, TLS SNI) is scanned for canary values.
 
-Requests the gateway can parse (plain HTTP, and plaintext tunnels to hosts
-with method or path rules) are relayed one by one so the allowlist rules and
-the ``Host`` header can be enforced on each of them.
+Requests the gateway can parse (plain HTTP, plaintext tunnels to hosts with
+method or path rules and, with TLS inspection, every HTTPS tunnel) are
+relayed one by one so the allowlist rules and the ``Host`` header can be
+enforced on each of them.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import asyncio
 import contextlib
 import ipaddress
 import socket
+import ssl
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -33,7 +36,7 @@ from .http1 import (
     parse_head,
     serialize_head,
 )
-from .tls import hello_complete, looks_like_tls, server_name
+from .tls import TLSServerSession, hello_complete, looks_like_tls, server_name
 
 __all__ = ["MAX_HEAD", "Proxy", "ProxyError", "Request", "parse_head", "serve", "split_host_port"]
 
@@ -53,6 +56,12 @@ HOP_BY_HOP = frozenset(
         "expect",
     }
 )
+
+
+class LeafIssuer(Protocol):
+    """Source of server TLS contexts presenting a certificate for a host."""
+
+    async def context_for(self, host: str) -> ssl.SSLContext: ...
 
 
 class Sink(Protocol):
@@ -98,13 +107,20 @@ class Proxy:
         max_body: int = 10 * 1024 * 1024,
         connect_timeout: float = 10.0,
         idle_timeout: float = 300.0,
+        tls_issuer: LeafIssuer | None = None,
+        upstream_tls: ssl.SSLContext | None = None,
     ) -> None:
+        """Create a proxy; with ``tls_issuer`` set, HTTPS tunnels are inspected."""
         self.allowlist = allowlist
         self.matcher = matcher
         self.log = log
         self.max_body = max_body
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
+        self.tls_issuer = tls_issuer
+        self.upstream_tls = upstream_tls
+        if tls_issuer is not None and upstream_tls is None:
+            self.upstream_tls = ssl.create_default_context()
 
     # ------------------------------------------------------------------ entry point
 
@@ -302,6 +318,11 @@ class Proxy:
                 )
                 upstream_writer.close()
                 return
+            if self.tls_issuer is not None:
+                await self._intercept(
+                    first, reader, writer, upstream_reader, upstream_writer, host, port, client
+                )
+                return
         elif self.allowlist.restricted(host, port):
             # Method and path rules apply to plaintext tunnels as well.
             self.log.event(
@@ -376,6 +397,72 @@ class Proxy:
                 sink.close()
 
     # ------------------------------------------------------------------ inspected sessions
+
+    async def _intercept(
+        self,
+        hello: bytes,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+        client: str,
+    ) -> None:
+        """Terminate the agent's TLS, re-encrypt upstream and relay requests in between."""
+        upstream_error = None
+        try:
+            await asyncio.wait_for(
+                upstream_writer.start_tls(self.upstream_tls, server_hostname=host),
+                self.connect_timeout,
+            )
+        except (ssl.SSLError, OSError, TimeoutError) as exc:
+            upstream_error = getattr(exc, "verify_message", None) or str(exc) or "timeout"
+            self.log.event(
+                "egress.tls_error", host=host, port=port, error=upstream_error, client=client
+            )
+        try:
+            context = await self.tls_issuer.context_for(host)  # type: ignore[union-attr]
+        except Exception as exc:  # Minting failed: openssl missing, disk full...
+            self.log.event("tls.error", host=host, error=str(exc), client=client)
+            upstream_writer.close()
+            return
+        session = TLSServerSession(reader, writer, context, hello)
+        try:
+            try:
+                await asyncio.wait_for(session.handshake(), self.connect_timeout)
+            except (ssl.SSLError, OSError, TimeoutError) as exc:
+                # Typically a client with a pinned certificate or its own root store.
+                self.log.event(
+                    "tls.client_rejected",
+                    host=host,
+                    port=port,
+                    error=str(exc) or "timeout",
+                    client=client,
+                )
+                return
+            source = BufferedReader(session.receive)
+            if upstream_error is not None:
+                # Answer the first request so the client shows a useful error.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(source.readuntil(b"\r\n\r\n"), self.connect_timeout)
+                await self._reply(session, 502, f"TLS connection to {host} failed verification")
+                return
+            self.log.event(
+                "egress.allowed",
+                host=host,
+                port=port,
+                method="CONNECT",
+                inspected=True,
+                tls=True,
+                client=client,
+            )
+            await self._relay_session(
+                source, session, upstream_reader, upstream_writer, host, port, client, tls=True
+            )
+        finally:
+            session.close()
+            upstream_writer.close()
 
     async def _relay_session(
         self,
@@ -464,8 +551,9 @@ class Proxy:
             if request.header("upgrade") is not None:
                 raise ProxyError(501, "protocol upgrades are not supported by the gateway")
             length = body_length(request)
-            upstream.write(serialize_head(request))
-            await self._relay_body(source, upstream, length, host, client, tls=tls)
+            await self._relay_body(
+                source, upstream, serialize_head(request), length, host, client, tls=tls
+            )
             self.log.event(
                 "egress.request",
                 host=host,
@@ -480,18 +568,39 @@ class Proxy:
         self,
         source: BufferedReader,
         sink: asyncio.StreamWriter,
+        head: bytes,
         length: int | None,
         host: str,
         client: str,
         *,
         tls: bool,
     ) -> None:
-        """Stream a request body upstream, scanning it without releasing a partial canary."""
+        """Send a request upstream once its body is scanned.
+
+        Bodies up to ``max_body`` are held with the head until they are complete,
+        so a request carrying a canary never reaches the server at all. Larger
+        bodies (uploads, git pushes) are streamed; the scanner holds back enough
+        bytes that a canary is detected before any part of it leaves, and the
+        server is left with a truncated request.
+        """
         scanner = StreamScanner(self.matcher)
         chunked = length is None
+        held: list[bytes] | None = [head]
+        held_size = 0
+
+        async def emit(data: bytes) -> None:
+            nonlocal held, held_size
+            if held is not None:
+                held.append(data)
+                held_size += len(data)
+                if held_size <= self.max_body:
+                    return
+                data, held = b"".join(held), None  # Too large to hold: stream the rest
+            sink.write(data)
+            await sink.drain()
 
         async def take(size: int) -> int:
-            """Consume up to ``size`` body bytes and forward what is proven clean."""
+            """Consume up to ``size`` body bytes and pass on what is proven clean."""
             data = await asyncio.wait_for(source.read(min(size, CHUNK)), self.idle_timeout)
             if not data:
                 raise ProxyError(400, "request body ended early")
@@ -499,16 +608,31 @@ class Proxy:
             if hits:
                 self._exfiltration(hits, client, where="request body", host=host, tls=tls)
             if safe:
-                sink.write(chunk(safe) if chunked else safe)
-                await sink.drain()
+                await emit(chunk(safe) if chunked else safe)
             return len(data)
 
         if length is not None:
             while length:
                 length -= await take(length)
-            sink.write(scanner.flush())
+            await emit(scanner.flush())
+        else:
+            await self._relay_chunks(source, scanner, take, emit, host, client, tls=tls)
+        if held is not None:
+            sink.write(b"".join(held))
             await sink.drain()
-            return
+
+    async def _relay_chunks(
+        self,
+        source: BufferedReader,
+        scanner: StreamScanner,
+        take: Callable[[int], Awaitable[int]],
+        emit: Callable[[bytes], Awaitable[None]],
+        host: str,
+        client: str,
+        *,
+        tls: bool,
+    ) -> None:
+        """Re-chunk a chunked body; chunk extensions and trailers are not forwarded."""
         while True:
             size = chunk_size(await asyncio.wait_for(source.readuntil(b"\r\n"), self.idle_timeout))
             if size == 0:
@@ -521,8 +645,7 @@ class Proxy:
                 # would have to be validated like headers.
                 self._check_canaries(trailers, client, where="request body", host=host, tls=tls)
                 tail = scanner.flush()
-                sink.write((chunk(tail) if tail else b"") + b"0\r\n\r\n")
-                await sink.drain()
+                await emit((chunk(tail) if tail else b"") + b"0\r\n\r\n")
                 return
             while size:
                 size -= await take(size)

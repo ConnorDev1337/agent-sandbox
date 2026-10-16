@@ -1,10 +1,14 @@
-"""Minimal TLS ClientHello parsing to read the SNI server name."""
+"""TLS helpers: ClientHello parsing (SNI) and server-side TLS over memory BIOs."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import ssl
 import struct
 
 _HANDSHAKE = 0x16
+_READ_SIZE = 64 * 1024
 _CLIENT_HELLO = 0x01
 _SERVER_NAME = 0x0000
 MAX_HELLO = 64 * 1024  # Larger first handshake messages are not legitimate ClientHellos
@@ -80,3 +84,98 @@ def server_name(data: bytes) -> str | None:
     except (IndexError, struct.error, UnicodeDecodeError):
         return None
     return None
+
+
+class TLSServerSession:
+    """Server side of a TLS connection driven over an existing asyncio stream.
+
+    ``asyncio``'s ``start_tls`` cannot be used here: the proxy has already read
+    the ClientHello from the stream to check its server name, so those bytes
+    are fed to an ``SSLObject`` through memory BIOs instead. Reads are pulled
+    on demand, so a slow upstream back-pressures the client.
+    """
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        context: ssl.SSLContext,
+        received: bytes = b"",
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._incoming = ssl.MemoryBIO()
+        self._outgoing = ssl.MemoryBIO()
+        self._ssl = context.wrap_bio(self._incoming, self._outgoing, server_side=True)
+        self._incoming.write(received)
+        self._closed = False
+
+    def _flush(self) -> None:
+        data = self._outgoing.read()
+        if data:
+            self._writer.write(data)
+
+    async def _receive_raw(self) -> bool:
+        await self._writer.drain()
+        data = await self._reader.read(_READ_SIZE)
+        if not data:
+            self._incoming.write_eof()
+            return False
+        self._incoming.write(data)
+        return True
+
+    async def handshake(self) -> None:
+        while True:
+            try:
+                self._ssl.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                self._flush()
+            if not await self._receive_raw():
+                raise ConnectionError("client closed the connection during the handshake")
+        self._flush()
+        await self._writer.drain()
+
+    @property
+    def alpn_protocol(self) -> str | None:
+        return self._ssl.selected_alpn_protocol()
+
+    async def receive(self) -> bytes:
+        """Return the next decrypted bytes, or ``b""`` once the client is done."""
+        while True:
+            try:
+                data = self._ssl.read(_READ_SIZE)
+            except ssl.SSLWantReadError:
+                self._flush()  # e.g. replies to key updates
+                if not await self._receive_raw():
+                    return b""
+                continue
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                return b""
+            self._flush()
+            return data
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            raise ConnectionError("TLS session is closed")
+        self._ssl.write(data)
+        self._flush()
+
+    async def drain(self) -> None:
+        await self._writer.drain()
+
+    def can_write_eof(self) -> bool:
+        return False
+
+    def write_eof(self) -> None:
+        raise NotImplementedError("TLS has no half-close")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(ssl.SSLError, ValueError):
+            self._ssl.unwrap()  # Queues close_notify; the peer's reply is not awaited
+        with contextlib.suppress(Exception):
+            self._flush()
+            self._writer.close()
