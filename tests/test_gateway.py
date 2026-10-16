@@ -45,9 +45,19 @@ class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _body(self):
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            body = b""
+            while size := int(self.rfile.readline().split(b";")[0], 16):
+                body += self.rfile.read(size)
+                self.rfile.readline()
+            while self.rfile.readline() not in (b"\r\n", b""):
+                pass
+            return body
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
     def _respond(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length)
+        body = self._body()
         Upstream.received.append((self.command, self.path, body, dict(self.headers)))
         payload = b"hello from upstream"
         self.send_response(200)
@@ -55,14 +65,31 @@ class Upstream(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    do_GET = do_POST = _respond
+    do_GET = do_POST = do_PUT = do_DELETE = _respond
+
+
+class KeepAliveUpstream(Upstream):
+    protocol_version = "HTTP/1.1"
+
+
+def _serve(handler):
+    Upstream.received = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 @pytest.fixture
 def upstream():
-    Upstream.received = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    server = _serve(Upstream)
+    yield server.server_address[1]
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture
+def keepalive_upstream():
+    server = _serve(KeepAliveUpstream)
     yield server.server_address[1]
     server.shutdown()
     server.server_close()
@@ -71,8 +98,10 @@ def upstream():
 class ProxyHarness:
     """Runs the proxy on an event loop in a background thread."""
 
-    def __init__(self, allow, canaries, log):
-        self.proxy = Proxy(Allowlist(allow), CanaryMatcher(canaries), log, connect_timeout=5)
+    def __init__(self, allow, canaries, log, **options):
+        self.proxy = Proxy(
+            Allowlist(allow), CanaryMatcher(canaries), log, connect_timeout=5, **options
+        )
         self.loop = asyncio.new_event_loop()
         ready = threading.Event()
 
@@ -107,8 +136,8 @@ class ProxyHarness:
 def harness(canaries, log):
     made = []
 
-    def _make(allow=("127.0.0.1",)):
-        h = ProxyHarness(list(allow), canaries, log)
+    def _make(allow=("127.0.0.1",), **options):
+        h = ProxyHarness(list(allow), canaries, log, **options)
         made.append(h)
         return h
 
@@ -202,6 +231,30 @@ def test_method_and_path_rules_on_plain_http(harness, upstream, log):
     assert not (log.directory / "alerts.jsonl").exists()
 
 
+def test_plain_http_host_header_must_match(harness, upstream, log):
+    h = harness([f"127.0.0.1:{upstream}"])
+    request = f"GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: evil.example\r\n\r\n"
+    assert h.raw(request.encode()).startswith(b"HTTP/1.1 403")
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["kind"] == MISMATCH and alert["requested"] == f"evil.example:{upstream}"
+    assert not Upstream.received
+
+
+@pytest.mark.parametrize(
+    "framing",
+    [
+        "Content-Length: 2\r\nTransfer-Encoding: chunked",
+        "Transfer-Encoding: gzip, chunked",
+        "Content-Length: 2\r\nContent-Length: 3",
+    ],
+)
+def test_ambiguous_body_framing_is_refused(harness, upstream, framing):
+    h = harness([f"127.0.0.1:{upstream}"])
+    request = f"POST http://127.0.0.1:{upstream}/ HTTP/1.1\r\n{framing}\r\n\r\nok"
+    assert h.raw(request.encode())[:12] in (b"HTTP/1.1 400", b"HTTP/1.1 501")
+    assert not Upstream.received
+
+
 def test_canary_in_url_and_headers(harness, upstream, canaries):
     token = next(c for c in canaries if c.kind == "git").secrets[0]
     h = harness([f"127.0.0.1:{upstream}"])
@@ -235,6 +288,93 @@ def test_connect_tunnel_scans_plaintext(harness, upstream, canaries, log):
     )
     assert b"hello from upstream" not in blocked
     assert read_jsonl(log.directory / "alerts.jsonl")[-1]["where"] == "tunnel data"
+
+
+def _restricted(port, *rules):
+    target = f"127.0.0.1:{port}"
+    return [{"host": target, **rule} for rule in rules] or [target]
+
+
+def test_restricted_plaintext_tunnel_relays_requests(harness, keepalive_upstream, log):
+    port = keepalive_upstream
+    h = harness(_restricted(port, {"methods": ["GET", "POST"]}))
+    big = b"x" * 200_000
+    requests = (
+        f"GET /one HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        f"POST /two HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {len(big)}\r\n"
+        "Proxy-Authorization: Basic eDp5\r\n\r\n"
+    ).encode() + big
+    response = h.raw(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n".encode(), read_after=requests)
+    assert response.count(b"hello from upstream") == 2
+    (get, post) = Upstream.received
+    assert (get[0], get[1], post[0], post[1]) == ("GET", "/one", "POST", "/two")
+    assert post[2] == big and "Proxy-Authorization" not in post[3]
+    events = [
+        e for e in read_jsonl(log.directory / "events.jsonl") if e["kind"] == "egress.request"
+    ]
+    assert [(e["method"], e["path"], e["tls"]) for e in events] == [
+        ("GET", "/one", False),
+        ("POST", "/two", False),
+    ]
+
+
+MISMATCH = "egress.host_mismatch"
+HOST = "Host: {target}\r\n"
+
+
+@pytest.mark.parametrize(
+    ("request_text", "status", "alert"),
+    [
+        ("DELETE /x HTTP/1.1\r\n" + HOST + "\r\n", b"403", None),
+        ("GET /x HTTP/1.1\r\nHost: evil.example\r\n\r\n", b"403", MISMATCH),
+        ("GET http://evil.example/ HTTP/1.1\r\n" + HOST + "\r\n", b"403", MISMATCH),
+        ("GET /x HTTP/1.1\r\n\r\n", b"400", None),
+        ("GET /x HTTP/1.1\r\n" + HOST + "Upgrade: websocket\r\n\r\n", b"501", None),
+        ("CONNECT {target} HTTP/1.1\r\n" + HOST + "\r\n", b"400", None),
+        ("SSH-2.0-OpenSSH_9.6\r\n\r\n", b"400", None),
+        ("GET /x HTTP/1.1\r\n" + HOST + "Transfer-Encoding: chunked\r\n\r\n0x1\r\n", b"400", None),
+    ],
+)
+def test_restricted_plaintext_tunnel_refusals(harness, upstream, log, request_text, status, alert):
+    target = f"127.0.0.1:{upstream}"
+    h = harness(_restricted(upstream, {"methods": ["GET"]}))
+    response = h.raw(
+        f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(),
+        read_after=request_text.format(target=target).encode(),
+    )
+    assert response.startswith(b"HTTP/1.1 " + status), response[:80]
+    assert b"agent-sandbox gateway" in response
+    assert not Upstream.received
+    alerts = [a["kind"] for a in read_jsonl(log.directory / "alerts.jsonl")]
+    assert alerts == ([alert] if alert else [])
+
+
+def test_canary_split_across_chunks_is_never_released(harness, upstream, canaries, log):
+    secret = next(c for c in canaries if c.kind == "github").secrets[0].encode()
+    target = f"127.0.0.1:{upstream}"
+    h = harness(_restricted(upstream, {"methods": ["POST"]}))
+    first, second = b"prefix-" + secret[:20], secret[20:] + b"-suffix"
+    body = b"%x\r\n%s\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(first), first, len(second), second)
+    request = (
+        f"POST /x HTTP/1.1\r\nHost: {target}\r\nTransfer-Encoding: chunked\r\n\r\n".encode() + body
+    )
+    response = h.raw(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(), read_after=request)
+    assert response.startswith(b"HTTP/1.1 403") and b"canary" in response
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["where"] == "request body" and alert["tls"] is False
+    assert all(secret[:20] not in r[2] for r in Upstream.received)
+
+
+def test_restricted_tunnel_chunked_body_is_rechunked(harness, upstream):
+    target = f"127.0.0.1:{upstream}"
+    h = harness(_restricted(upstream, {"methods": ["PUT"], "paths": ["/files/*"]}))
+    body = b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: 1\r\n\r\n"
+    request = (
+        f"PUT /files/a HTTP/1.1\r\nHost: {target}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    ).encode() + body
+    response = h.raw(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(), read_after=request)
+    assert response.endswith(b"hello from upstream")
+    assert Upstream.received[0][2] == b"hello world"
 
 
 def test_connect_denied_and_unreachable(harness, log):
