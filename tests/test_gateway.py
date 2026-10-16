@@ -181,6 +181,27 @@ def test_chunked_body_and_expect_continue(harness, upstream, canaries):
     assert Upstream.received[-1][2] == b"hello"
 
 
+def test_method_and_path_rules_on_plain_http(harness, upstream, log):
+    target = f"127.0.0.1:{upstream}"
+    h = harness(
+        [
+            {"host": target, "methods": ["GET"]},
+            {"host": target, "methods": ["POST"], "paths": ["/api/*"]},
+        ]
+    )
+    assert h.raw(f"GET http://{target}/x HTTP/1.1\r\n\r\n".encode()).endswith(b"upstream")
+    post = f"POST http://{target}/api/items HTTP/1.1\r\nContent-Length: 2\r\n\r\nok"
+    assert h.raw(post.encode()).endswith(b"upstream")
+    denied = h.raw(f"DELETE http://{target}/x HTTP/1.1\r\n\r\n".encode())
+    assert denied.startswith(b"HTTP/1.1 403") and b"DELETE /x is not allowed" in denied
+    other = f"POST http://{target}/other HTTP/1.1\r\nContent-Length: 2\r\n\r\nok"
+    assert h.raw(other.encode()).startswith(b"HTTP/1.1 403")
+    assert [r[0] for r in Upstream.received] == ["GET", "POST"]
+    event = read_jsonl(log.directory / "events.jsonl")[-1]
+    assert event["kind"] == "egress.denied" and event["path"] == "/other"
+    assert not (log.directory / "alerts.jsonl").exists()
+
+
 def test_canary_in_url_and_headers(harness, upstream, canaries):
     token = next(c for c in canaries if c.kind == "git").secrets[0]
     h = harness([f"127.0.0.1:{upstream}"])

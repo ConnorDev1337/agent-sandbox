@@ -190,6 +190,20 @@ class Proxy:
             self.log.event("egress.denied", host=host, port=port, method=method, client=client)
             raise ProxyError(403, f"blocked: {host}:{port} is not in the allowlist")
 
+    def _check_request(self, host: str, port: int, method: str, path: str, client: str) -> None:
+        """Apply the method and path rules of the allowlist to one visible request."""
+        if not self.allowlist.permits(host, port, method, path):
+            self.log.event(
+                "egress.denied",
+                host=host,
+                port=port,
+                method=method,
+                path=path[:200],
+                reason="method or path not allowed",
+                client=client,
+            )
+            raise ProxyError(403, f"blocked: {method} {path[:100]} is not allowed for {host}")
+
     async def _resolve(self, host: str, port: int) -> list[str]:
         """Return the public addresses of ``host``, IPv4 first.
 
@@ -371,13 +385,14 @@ class Proxy:
         except ValueError:
             raise ProxyError(400, "invalid host") from None
         self._authorize(host, port, request.method, client)
+        path = url.path or "/"
+        self._check_request(host, port, request.method, path, client)
         if (request.header("expect") or "").lower() == "100-continue":
             writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
             await writer.drain()
         body = await self._read_body(request, reader)
         self._check_canaries(body, client, where="request body", host=host)
 
-        path = url.path or "/"
         if url.query:
             path += "?" + url.query
         lines = [f"{request.method} {path} HTTP/1.1"]

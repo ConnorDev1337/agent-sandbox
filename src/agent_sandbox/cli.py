@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, compose
+from .allowlist import Allowlist
 from .canary import generate, load_registry, save_registry
 from .config import CONFIG_FILE, ConfigError, SandboxConfig, load
 
@@ -74,7 +75,13 @@ def _ensure_canaries(config: SandboxConfig, *, rotate: bool = False) -> int:
     return len(canaries)
 
 
+def _warn(config: SandboxConfig) -> None:
+    for message in config.warnings():
+        print(f"warning: {message}", file=sys.stderr)
+
+
 def _prepare(config: SandboxConfig) -> None:
+    _warn(config)
     _ensure_canaries(config)
     compose.write(config)
 
@@ -95,6 +102,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def cmd_init(config: SandboxConfig, args: argparse.Namespace) -> int:
+    _warn(config)
     count = _ensure_canaries(config, rotate=args.rotate)
     compose.write(config)
     sample = config.workspace / CONFIG_FILE
@@ -104,7 +112,8 @@ def cmd_init(config: SandboxConfig, args: argparse.Namespace) -> int:
     print(f"sandbox {config.project}")
     print(f"  state      {config.state_dir}")
     print(f"  canaries   {count} ({'rotated' if args.rotate else 'kept'})")
-    print(f"  allowlist  {', '.join(config.allow)}")
+    print(f"  allowlist  {', '.join(rule.describe() for rule in config.rules())}")
+    print(f"  tls        {'inspected' if config.tls_inspect else 'not inspected (SNI only)'}")
     return 0
 
 
@@ -181,7 +190,14 @@ def cmd_alerts(config: SandboxConfig, args: argparse.Namespace) -> int:
 
 
 def _allowed_host(config: SandboxConfig) -> str:
-    return next((h for h in config.allow if not h.startswith("*.") and ":" not in h), "pypi.org")
+    """Return the first allowlisted name that accepts any request on ports 80 and 443."""
+    allowlist = Allowlist(config.allow, config.default_ports)
+    for rule in allowlist.rules:
+        if rule.host.startswith("*.") or not {80, 443} <= set(rule.ports):
+            continue
+        if not (allowlist.restricted(rule.host, 80) or allowlist.restricted(rule.host, 443)):
+            return rule.host
+    return "pypi.org"
 
 
 def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
@@ -237,6 +253,7 @@ def cmd_config(config: SandboxConfig, _args: argparse.Namespace) -> int:
         "state_dir": str(config.state_dir),
         "allow": list(config.allow),
         "default_ports": list(config.default_ports),
+        "tls_inspect": config.tls_inspect,
         "subnet": config.subnet,
         "gateway_ip": config.gateway_ip,
         "agent_ip": config.agent_ip,
