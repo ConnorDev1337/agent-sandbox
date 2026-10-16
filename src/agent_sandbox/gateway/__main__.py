@@ -35,7 +35,9 @@ async def _run(args: argparse.Namespace) -> None:
     if canaries and config.get("seed_canaries", True):
         paths = seed(args.home, canaries, config.get("uid", 1000), config.get("gid", 1000))
         watched = {p: c for p, c in zip(paths, canaries, strict=True) if c.tripwire}
-        Tripwire(watched, log).start()
+        tripwire = Tripwire(watched, log)
+        tripwire.arm()  # Watches exist before the proxy accepts connections
+        tripwire.start()
 
     allowlist = Allowlist(config.get("allow", []), config.get("default_ports", (80, 443)))
     server = await proxy.serve(
