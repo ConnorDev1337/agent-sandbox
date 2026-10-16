@@ -53,10 +53,49 @@ webhook = "https://hooks.example/abc"
     assert config.gateway_settings()["webhook"] == "https://hooks.example/abc"
 
 
+def test_rule_tables_and_tls_inspect(workspace):
+    write_config(
+        workspace,
+        """
+[network]
+tls_inspect = true
+allow = [
+  "api.anthropic.com",
+  { host = "github.com", methods = ["GET", "HEAD"] },
+  { host = "github.com", methods = ["POST"], paths = ["/*/git-upload-pack"] },
+]
+""",
+    )
+    config = load(workspace)
+    assert config.tls_inspect is True and config.warnings() == []
+    assert config.allow[-1] == {
+        "host": "github.com",
+        "methods": ["POST"],
+        "paths": ["/*/git-upload-pack"],
+    }
+    settings = config.gateway_settings()
+    assert settings["tls_inspect"] is True and settings["allow"][-2]["methods"] == ["GET", "HEAD"]
+    assert json.loads(json.dumps(settings)) == settings
+
+
+def test_rules_without_inspection_warn(workspace):
+    write_config(workspace, '[network]\nallow = [{ host = "github.com", methods = ["GET"] }]\n')
+    config = load(workspace)
+    assert config.tls_inspect is False
+    (warning,) = config.warnings()
+    assert "github.com [GET]" in warning and "tls_inspect" in warning
+
+
 @pytest.mark.parametrize(
     ("text", "message"),
     [
         ("[nope]\n", "unknown section"),
+        ('[network]\ntls_inspect = "yes"\n', "true or false"),
+        ("[network]\nallow = [1]\n", "strings or tables"),
+        (
+            '[network]\nallow = [{ host = "x.example", methods = ["BAD METHOD"] }]\n',
+            "network.allow",
+        ),
         ("[network]\ncolour = 1\n", "unknown key"),
         ('[network]\nallow = ["bad host"]\n', "network.allow"),
         ('[network]\nsubnet = "8.8.8.0/24"\n', "private IPv4"),

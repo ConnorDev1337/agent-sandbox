@@ -120,7 +120,21 @@ def test_errors(capsys, workspace, docker, monkeypatch):
     assert run(capsys, workspace, "config")[0] == 2
 
 
+def test_rules_are_described_and_weak_settings_warned(capsys, workspace):
+    (workspace / ".agent-sandbox.toml").write_text(
+        '[network]\nallow = [{ host = "pypi.org", methods = ["GET"] }, "api.example.com"]\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, workspace, "init")
+    assert code == 0 and "pypi.org [GET]" in out and "not inspected" in out
+    assert "warning: network.allow" in err
+    # pypi.org is read-only now, so the self-test must POST its canary elsewhere.
+    assert cli._allowed_host(load(workspace)) == "files.pythonhosted.org"
+
+
 def test_config_and_help(capsys, workspace):
     code, out, _ = run(capsys, workspace, "config")
-    assert code == 0 and json.loads(out)["gateway_ip"] == "172.31.250.2"
+    payload = json.loads(out)
+    assert code == 0 and payload["gateway_ip"] == "172.31.250.2"
+    assert payload["tls_inspect"] is False
     assert cli.main([]) == 2

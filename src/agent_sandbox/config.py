@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .allowlist import parse_rule
+from .allowlist import AllowEntry, AllowRule, parse_rule
 from .canary import KINDS
 
 CONFIG_FILE = ".agent-sandbox.toml"
@@ -33,7 +33,7 @@ DEFAULT_ALLOW = (
 )
 _SECTIONS = {
     "sandbox": {"name", "agent_image"},
-    "network": {"allow", "extend_default_allow", "default_ports", "subnet"},
+    "network": {"allow", "extend_default_allow", "default_ports", "subnet", "tls_inspect"},
     "resources": {"cpus", "memory", "pids"},
     "env": {"pass", "set"},
     "canaries": {"kinds"},
@@ -56,9 +56,10 @@ def _slug(text: str) -> str:
 class SandboxConfig:
     workspace: Path
     name: str
-    allow: tuple[str, ...] = DEFAULT_ALLOW
+    allow: tuple[AllowEntry, ...] = DEFAULT_ALLOW
     default_ports: tuple[int, ...] = (80, 443)
     subnet: str = "172.31.250.0/24"
+    tls_inspect: bool = False
     cpus: float = 2.0
     memory: str = "4g"
     pids: int = 512
@@ -109,10 +110,25 @@ class SandboxConfig:
     def log_dir(self) -> Path:
         return self.state_dir / "logs"
 
+    def rules(self) -> list[AllowRule]:
+        return [parse_rule(entry, self.default_ports) for entry in self.allow]
+
+    def warnings(self) -> list[str]:
+        """Describe settings that are valid but weaker than they look."""
+        if self.tls_inspect:
+            return []
+        return [
+            f"network.allow: the method/path rule for {rule.describe()} is enforced on plain "
+            "HTTP only; HTTPS requests are not visible without [network] tls_inspect = true"
+            for rule in self.rules()
+            if rule.restricted
+        ]
+
     def gateway_settings(self) -> dict[str, Any]:
         return {
-            "allow": list(self.allow),
+            "allow": [dict(e) if isinstance(e, dict) else e for e in self.allow],
             "default_ports": list(self.default_ports),
+            "tls_inspect": self.tls_inspect,
             "webhook": self.webhook,
             "uid": 1000,
             "gid": 1000,
@@ -158,8 +174,10 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
     canaries = _section(data, "canaries")
     alerts = _section(data, "alerts")
 
-    extra = _strings(network.get("allow", []), "network.allow")
-    allow = (DEFAULT_ALLOW if network.get("extend_default_allow", True) else ()) + extra
+    extra = network.get("allow", [])
+    if not isinstance(extra, list) or not all(isinstance(e, str | dict) for e in extra):
+        raise ConfigError("network.allow must be a list of strings or tables")
+    allow = (DEFAULT_ALLOW if network.get("extend_default_allow", True) else ()) + tuple(extra)
     ports = network.get("default_ports", [80, 443])
     if not isinstance(ports, list) or not all(isinstance(p, int) and 0 < p < 65536 for p in ports):
         raise ConfigError("network.default_ports must be a list of TCP ports")
@@ -168,6 +186,10 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
             parse_rule(entry, ports)
         except ValueError as exc:
             raise ConfigError(f"network.allow: {exc}") from None
+
+    tls_inspect = network.get("tls_inspect", False)
+    if not isinstance(tls_inspect, bool):
+        raise ConfigError("network.tls_inspect must be true or false")
 
     subnet = str(network.get("subnet", "172.31.250.0/24"))
     try:
@@ -210,6 +232,7 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
         allow=allow,
         default_ports=tuple(ports),
         subnet=str(net),
+        tls_inspect=tls_inspect,
         cpus=float(cpus),
         memory=memory,
         pids=pids,
