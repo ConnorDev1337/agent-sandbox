@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 
 from ..canary import CanaryMatcher
 from .alerts import EventLog
 
 NXDOMAIN = 3
+ALERT_DEBOUNCE = 10.0  # Seconds; resolvers ask for A and AAAA at once
 FORMERR = 1
 QTYPES = {1: "A", 2: "NS", 5: "CNAME", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS"}
 
@@ -58,6 +60,7 @@ class SinkholeProtocol(asyncio.DatagramProtocol):
         self.matcher = matcher
         self.log = log
         self.transport: asyncio.DatagramTransport | None = None
+        self._last_alert: dict[str, float] = {}
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
@@ -71,7 +74,11 @@ class SinkholeProtocol(asyncio.DatagramProtocol):
             self.log.event(
                 "dns.query", name=name[:253], qtype=QTYPES.get(qtype, qtype), client=addr[0]
             )
+            now = time.monotonic()
             for hit in self.matcher.scan_hostname(name):
+                if now - self._last_alert.get(hit.canary_id, -ALERT_DEBOUNCE) < ALERT_DEBOUNCE:
+                    continue
+                self._last_alert[hit.canary_id] = now
                 self.log.alert(
                     "canary.dns",
                     "critical",

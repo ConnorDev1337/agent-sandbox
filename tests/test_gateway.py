@@ -328,3 +328,59 @@ def test_alert_validation_and_webhook_failure(tmp_path):
         log.alert("x", "fatal", "y")
     log._notify({"severity": "critical", "message": "m"})
     assert read_jsonl(tmp_path / "events.jsonl")[-1]["kind"] == "alert.webhook_failed"
+
+
+@pytest.mark.parametrize(
+    ("address", "public"),
+    [
+        ("93.184.216.34", True),
+        ("2606:4700::1111", True),
+        ("127.0.0.1", False),
+        ("10.1.2.3", False),
+        ("169.254.169.254", False),
+        ("100.64.0.1", False),
+        ("::1", False),
+        ("fe80::1%eth0", False),
+        ("::ffff:192.168.1.1", False),
+        ("224.0.0.1", False),
+    ],
+)
+def test_is_public(address, public):
+    from agent_sandbox.gateway.proxy import is_public
+
+    assert is_public(address) is public
+
+
+def test_resolution_refuses_private_targets(monkeypatch, canaries, log):
+    from agent_sandbox.gateway.proxy import ProxyError
+
+    answers = {
+        "rebind.example": ["127.0.0.1", "169.254.169.254"],
+        "mixed.example": ["2606:4700::1111", "10.0.0.5", "93.184.216.34"],
+    }
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port)) for a in answers[host]]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    proxy = Proxy(Allowlist([]), CanaryMatcher(canaries), log)
+    with pytest.raises(ProxyError) as info:
+        asyncio.run(proxy._resolve("rebind.example", 443))
+    assert info.value.status == 403
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["kind"] == "egress.private_address"
+    assert asyncio.run(proxy._resolve("mixed.example", 443)) == [
+        "93.184.216.34",
+        "2606:4700::1111",
+    ]
+    assert asyncio.run(proxy._resolve("10.9.8.7", 443)) == ["10.9.8.7"]  # explicit literal
+
+
+def test_dns_alerts_are_debounced(canaries, log):
+    secret = next(c for c in canaries if c.kind == "aws").secrets[0].encode().hex()
+    protocol = dns.SinkholeProtocol(CanaryMatcher(canaries), log)
+    for qtype in (1, 28):
+        labels = b"".join(bytes([len(p)]) + p.encode() for p in (secret, "x", "example"))
+        packet = struct.pack("!HHHHHH", 1, 0x0100, 1, 0, 0, 0) + labels + b"\0"
+        protocol.datagram_received(packet + struct.pack("!HH", qtype, 1), ("1.2.3.4", 1))
+    assert len(read_jsonl(log.directory / "alerts.jsonl")) == 1

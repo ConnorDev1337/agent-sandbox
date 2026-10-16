@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
+import socket
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -55,6 +57,14 @@ class Request:
     def header(self, name: str) -> str | None:
         name = name.lower()
         return next((v for k, v in self.headers if k.lower() == name), None)
+
+
+def is_public(address: str) -> bool:
+    """Return True for globally routable unicast addresses."""
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
 
 
 def parse_head(head: bytes) -> Request:
@@ -180,16 +190,53 @@ class Proxy:
             self.log.event("egress.denied", host=host, port=port, method=method, client=client)
             raise ProxyError(403, f"blocked: {host}:{port} is not in the allowlist")
 
-    async def _open(
-        self, host: str, port: int
-    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def _resolve(self, host: str, port: int) -> list[str]:
+        """Return the public addresses of ``host``, IPv4 first.
+
+        Allowlisted names that resolve only to private, loopback or link-local
+        addresses are refused (DNS rebinding, cloud metadata endpoints). IP
+        literals are returned as is: the allowlist only accepts them when listed.
+        """
         try:
-            return await asyncio.wait_for(
-                asyncio.open_connection(host, port), self.connect_timeout
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            return [host]
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), self.connect_timeout
             )
         except (OSError, TimeoutError) as exc:
             self.log.event("egress.error", host=host, port=port, error=str(exc) or "timeout")
-            raise ProxyError(502, f"cannot reach {host}:{port}") from None
+            raise ProxyError(502, f"cannot resolve {host}") from None
+        addresses = list(dict.fromkeys(info[4][0] for info in infos))
+        public = sorted((a for a in addresses if is_public(a)), key=lambda a: ":" in a)
+        if not public:
+            self.log.alert(
+                "egress.private_address",
+                "warning",
+                f"{host} resolves only to non-public addresses",
+                host=host,
+                addresses=addresses[:5],
+            )
+            raise ProxyError(403, f"blocked: {host} resolves to a non-public address")
+        return public
+
+    async def _open(
+        self, host: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        error = "no address"
+        for address in await self._resolve(host, port):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(address, port), self.connect_timeout
+                )
+            except (OSError, TimeoutError) as exc:
+                error = str(exc) or "timeout"
+        self.log.event("egress.error", host=host, port=port, error=error)
+        raise ProxyError(502, f"cannot reach {host}:{port}")
 
     # ------------------------------------------------------------------ CONNECT tunnels
 

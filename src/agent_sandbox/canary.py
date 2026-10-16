@@ -36,6 +36,7 @@ class Canary:
     secrets: tuple[str, ...]  # values that must never leave the sandbox
     hosts: tuple[str, ...] = ()  # canary hostnames that must never be contacted
     mode: int = 0o600
+    tripwire: bool = True  # Alert when the file is opened
 
 
 def _token(alphabet: str, length: int) -> str:
@@ -87,7 +88,8 @@ def _dotenv(cid: str) -> Canary:
 def _netrc(cid: str) -> Canary:
     password = _token(_ALNUM, 28)
     content = f"machine deploy.corp-internal.example\n  login svc-deploy\n  password {password}\n"
-    return Canary(cid, "netrc", ".netrc", content, (password,))
+    # curl and git read ~/.netrc on their own, so opening it is not suspicious.
+    return Canary(cid, "netrc", ".netrc", content, (password,), tripwire=False)
 
 
 def _git(cid: str) -> Canary:
@@ -150,6 +152,7 @@ def load_registry(path: Path) -> list[Canary]:
             secrets=tuple(item["secrets"]),
             hosts=tuple(item.get("hosts", ())),
             mode=int(item.get("mode", 0o600)),
+            tripwire=bool(item.get("tripwire", True)),
         )
         for item in data["canaries"]
     ]

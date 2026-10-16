@@ -100,6 +100,10 @@ def test_compose_hardening(workspace):
     assert agent["dns"] == [config.gateway_ip]
     assert agent["environment"]["HTTPS_PROXY"] == f"http://{config.gateway_ip}:3128"
     assert spec["networks"]["sandbox"]["internal"] is True
+    assert spec["networks"]["sandbox"]["driver_opts"] == {
+        "com.docker.network.bridge.inhibit_ipv4": "true"
+    }
+    assert config.bridge_ip == "172.31.250.1"
     assert set(gateway["networks"]) == {"sandbox", "egress"}
     assert set(gateway["cap_add"]) == {"CHOWN", "DAC_OVERRIDE", "FOWNER", "NET_BIND_SERVICE"}
 

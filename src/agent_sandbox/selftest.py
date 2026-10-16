@@ -125,6 +125,19 @@ def _no_route(_args):
     return False, "connected to 1.1.1.1:443 without the proxy"
 
 
+@check("host is unreachable on the sandbox network")
+def _host_unreachable(args):
+    for port in (22, 80, 443, 2375):
+        try:
+            socket.create_connection((args.host_ip, port), timeout=3).close()
+        except ConnectionRefusedError:
+            return False, f"{args.host_ip}:{port} answered (connection refused)"
+        except OSError:
+            continue
+        return False, f"connected to {args.host_ip}:{port}"
+    return True, f"no answer from {args.host_ip}"
+
+
 @check("external DNS is sinkholed")
 def _dns(_args):
     try:
@@ -193,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="selftest")
     parser.add_argument("--allowed-host", default="pypi.org")
     parser.add_argument("--denied-host", default="example.com")
+    parser.add_argument("--host-ip", default="172.31.250.1")
     args = parser.parse_args(argv)
     failed = 0
     for name, func in CHECKS:

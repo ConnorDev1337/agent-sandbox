@@ -76,6 +76,11 @@ class SandboxConfig:
         return f"agent-sandbox-{self.name}-{digest}"
 
     @property
+    def bridge_ip(self) -> str:
+        """Address Docker would give the host on the sandbox bridge."""
+        return str(ipaddress.ip_network(self.subnet).network_address + 1)
+
+    @property
     def gateway_ip(self) -> str:
         return str(ipaddress.ip_network(self.subnet).network_address + 2)
 

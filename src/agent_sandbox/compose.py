@@ -113,7 +113,13 @@ def build(config: SandboxConfig) -> dict[str, Any]:
         "name": config.project,
         "services": {"gateway": gateway, "agent": agent},
         "networks": {
-            "sandbox": {"internal": True, "ipam": {"config": [{"subnet": config.subnet}]}},
+            "sandbox": {
+                "internal": True,
+                "ipam": {"config": [{"subnet": config.subnet}]},
+                # Without this the host owns an address on the bridge and every host
+                # service listening on 0.0.0.0 is reachable from the agent.
+                "driver_opts": {"com.docker.network.bridge.inhibit_ipv4": "true"},
+            },
             "egress": {},
         },
         "volumes": {"home": {}},

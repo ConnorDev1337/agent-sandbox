@@ -119,3 +119,10 @@ def test_encodings_skip_short_needles():
     assert all(not needles for needles in forms.values())
     canary = Canary("id1", "custom", "x", "x", ("short",))
     assert CanaryMatcher([canary]).scan("short") == []
+
+
+def test_netrc_is_not_a_tripwire(canaries, tmp_path):
+    by_kind = {c.kind: c for c in canaries}
+    assert by_kind["netrc"].tripwire is False and by_kind["aws"].tripwire is True
+    save_registry(canaries, tmp_path / "r.json")
+    assert {c.kind: c.tripwire for c in load_registry(tmp_path / "r.json")}["netrc"] is False

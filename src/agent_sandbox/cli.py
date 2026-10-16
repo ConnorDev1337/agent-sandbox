@@ -193,6 +193,8 @@ def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
         "/opt/agent-sandbox/selftest.py",
         "--allowed-host",
         _allowed_host(config),
+        "--host-ip",
+        config.bridge_ip,
     ]
     result = run(
         compose_command(config, "exec", "-T", "agent", *command), capture=True, check=False
