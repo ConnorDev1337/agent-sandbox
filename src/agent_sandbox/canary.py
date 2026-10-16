@@ -220,6 +220,7 @@ class CanaryMatcher:
             for host in canary.hosts:
                 self._hosts.append((host.lower(), canary))
                 self._needles.append((host.lower().encode(), canary, "hostname"))
+        self.longest = max((len(needle) for needle, _, _ in self._needles), default=0)
 
     def scan(self, data: bytes | str) -> list[CanaryHit]:
         """Every canary whose value (in any known encoding) occurs in ``data``."""
@@ -241,3 +242,32 @@ class CanaryMatcher:
             if lowered == host or lowered.endswith("." + host):
                 hits.setdefault(canary.id, CanaryHit(canary.id, canary.kind, "hostname"))
         return list(hits.values())
+
+
+class StreamScanner:
+    """Scan a byte stream piece by piece and release only data proven canary-free.
+
+    The last ``longest - 1`` bytes are held back until more data (or the end of
+    the stream) arrives, so a canary split across pieces is caught before any
+    part of it is released.
+    """
+
+    def __init__(self, matcher: CanaryMatcher) -> None:
+        self._matcher = matcher
+        self._hold = max(matcher.longest - 1, 0)
+        self._tail = b""
+
+    def feed(self, data: bytes) -> tuple[bytes, list[CanaryHit]]:
+        """Return the bytes that are safe to forward, or the canaries found."""
+        window = self._tail + data
+        hits = self._matcher.scan(window)
+        if hits:
+            return b"", hits
+        cut = max(len(window) - self._hold, 0)
+        self._tail = window[cut:]
+        return window[:cut], []
+
+    def flush(self) -> bytes:
+        """Release the held-back bytes at the end of the stream (already scanned)."""
+        tail, self._tail = self._tail, b""
+        return tail

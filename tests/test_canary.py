@@ -8,6 +8,7 @@ from agent_sandbox.canary import (
     KINDS,
     Canary,
     CanaryMatcher,
+    StreamScanner,
     encodings,
     generate,
     load_registry,
@@ -126,3 +127,23 @@ def test_netrc_is_not_a_tripwire(canaries, tmp_path):
     assert by_kind["netrc"].tripwire is False and by_kind["aws"].tripwire is True
     save_registry(canaries, tmp_path / "r.json")
     assert {c.kind: c.tripwire for c in load_registry(tmp_path / "r.json")}["netrc"] is False
+
+
+def test_stream_scanner_holds_back_split_canaries(canaries, matcher):
+    secret = next(c for c in canaries if c.kind == "aws").secrets[1].encode()
+    scanner = StreamScanner(matcher)
+    clean = b"a" * 1000
+    released, hits = scanner.feed(clean + secret[:15])
+    assert hits == [] and released == clean[: len(released)]
+    assert secret[:15] not in released and len(released) <= 1000
+    released, hits = scanner.feed(secret[15:])
+    assert released == b"" and hits[0].kind == "aws"
+
+
+def test_stream_scanner_releases_everything_eventually(matcher):
+    scanner = StreamScanner(matcher)
+    pieces = [bytes([65 + i % 26]) * 700 for i in range(20)]
+    released = b"".join(scanner.feed(piece)[0] for piece in pieces) + scanner.flush()
+    assert released == b"".join(pieces) and scanner.flush() == b""
+    empty = StreamScanner(CanaryMatcher([]))
+    assert empty.feed(b"abc") == (b"abc", [])
