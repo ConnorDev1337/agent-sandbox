@@ -65,7 +65,7 @@ PASS  gateway raised a canary.file_access alert        found
 Requirements: Docker Engine or Docker Desktop with Compose v2, Python 3.11+.
 
 ```bash
-pip install git+<repo-url>            # or: pip install -e . from a clone
+pip install git+https://gitlab.com/connorhack/tools/agent-sandbox.git   # or: pip install -e . from a clone
 cd ~/code/my-project
 agent-sandbox init --write-config     # canaries + .agent-sandbox.toml (no secrets in it)
 agent-sandbox up --build              # build images, start gateway + agent
