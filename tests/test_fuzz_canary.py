@@ -42,15 +42,20 @@ def restyled(draw, text: str, style: str) -> str:
     if style == "wrapped":
         breaks = draw(st.lists(st.sampled_from(BREAKS), min_size=1, max_size=3))
         return wrap(text, draw(st.integers(4, 80)), breaks)
-    if style == "padded":  # Whitespace between some characters
+    if style == "padded":  # Whitespace between some characters, not inside line breaks
+        flags = [f and c not in "=\r\n" for c, f in zip(text, flags, strict=True)]
         gaps = draw(st.lists(st.sampled_from(BREAKS[:4]), min_size=1, max_size=4))
         return "".join(
             c + (gaps[n % len(gaps)] if f else "")
             for n, (c, f) in enumerate(zip(text, flags, strict=True))
         )
-    if style in {"percent", "all percent"}:
+    if style == "all percent":
+        return "".join(f"%{ord(c):02X}" for c in text)
+    if style == "percent":
+        # Some characters, never part of a line break: an encoder escapes
+        # either all of a soft line break or none of it.
         return "".join(
-            f"%{ord(c):02X}" if f or style == "all percent" else c
+            f"%{ord(c):02X}" if f and c not in "=\r\n" else c
             for c, f in zip(text, flags, strict=True)
         )
     return "".join(c.upper() if f else c.lower() for c, f in zip(text, flags, strict=True))
