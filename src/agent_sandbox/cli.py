@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import __version__, compose
+from . import __version__, compose, runtime
 from .allowlist import Allowlist
 from .canary import generate, load_registry, save_registry
 from .config import CONFIG_FILE, ConfigError, SandboxConfig, load
@@ -93,6 +93,38 @@ def _prepare(config: SandboxConfig) -> None:
     compose.write(config)
 
 
+def _docker_info() -> dict[str, Any]:
+    result = run([_docker(), "info", "--format", "{{json .}}"], capture=True)
+    try:
+        info = json.loads(result.stdout)
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        raise CommandError("docker info did not return a JSON object")
+    return info
+
+
+def _preflight(config: SandboxConfig) -> dict[str, Any] | None:
+    """Check that the Docker daemon provides the configured runtime; return its info."""
+    try:
+        info = _docker_info()
+    except CommandError:
+        if config.runtime == runtime.GVISOR:
+            raise
+        return None  # Compose reports an unreachable daemon itself
+    for message in runtime.check(info, config.runtime):
+        print(f"warning: {message}", file=sys.stderr)
+    return info
+
+
+def _start(config: SandboxConfig, *, build: bool) -> None:
+    _prepare(config)
+    command = compose_command(config, "up", "-d", "--wait")
+    if build:
+        command.insert(command.index("up") + 1, "--build")
+    run(command)
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -121,15 +153,13 @@ def cmd_init(config: SandboxConfig, args: argparse.Namespace) -> int:
     print(f"  canaries   {count} ({'rotated' if args.rotate else 'kept'})")
     print(f"  allowlist  {', '.join(rule.describe() for rule in config.rules())}")
     print(f"  tls        {'inspected' if config.tls_inspect else 'not inspected (SNI only)'}")
+    print(f"  runtime    {config.runtime}")
     return 0
 
 
 def cmd_up(config: SandboxConfig, args: argparse.Namespace) -> int:
-    _prepare(config)
-    command = compose_command(config, "up", "-d", "--wait")
-    if args.build:
-        command.insert(command.index("up") + 1, "--build")
-    run(command)
+    _preflight(config)
+    _start(config, build=args.build)
     print(f"sandbox {config.project} is running; open a shell with: agent-sandbox shell")
     return 0
 
@@ -222,8 +252,9 @@ def _restricted_target(config: SandboxConfig) -> tuple[str, str] | None:
 
 def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
     started = _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
+    info = _preflight(config)
     if not args.no_up:
-        cmd_up(config, argparse.Namespace(build=args.build))
+        _start(config, build=args.build)
     command = [
         "python3",
         "/opt/agent-sandbox/selftest.py",
@@ -231,7 +262,11 @@ def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
         _allowed_host(config),
         "--host-ip",
         config.bridge_ip,
+        "--runtime",
+        config.runtime,
     ]
+    if info and info.get("KernelVersion"):
+        command += ["--host-kernel", str(info["KernelVersion"])]
     if config.tls_inspect:
         command.append("--tls-inspect")
     target = _restricted_target(config)
@@ -284,6 +319,7 @@ def cmd_config(config: SandboxConfig, _args: argparse.Namespace) -> int:
         "default_ports": list(config.default_ports),
         "tls_inspect": config.tls_inspect,
         "undecodable_bodies": config.undecodable_bodies,
+        "runtime": config.runtime,
         "subnet": config.subnet,
         "gateway_ip": config.gateway_ip,
         "agent_ip": config.agent_ip,
@@ -293,6 +329,23 @@ def cmd_config(config: SandboxConfig, _args: argparse.Namespace) -> int:
         "webhook": bool(config.webhook),
     }
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_doctor(config: SandboxConfig, _args: argparse.Namespace) -> int:
+    info = _docker_info()
+    runtimes = info.get("Runtimes") or {}
+    print(f"docker     {info.get('ServerVersion', '?')} ({info.get('OperatingSystem', '?')})")
+    print(f"kernel     {info.get('KernelVersion', '?')}")
+    default = info.get("DefaultRuntime", "?")
+    print(f"runtimes   {', '.join(sorted(runtimes)) or 'none'} (default: {default})")
+    entry = runtimes.get(runtime.GVISOR)
+    if isinstance(entry, dict):
+        binary = entry.get("path") or entry.get("runtimeType", "?")
+        print(f"runsc      {' '.join([binary, *entry.get('runtimeArgs', [])])}")
+    for message in runtime.check(info, config.runtime):
+        print(f"warning: {message}", file=sys.stderr)
+    print(f"agent      {config.runtime}: ok")
     return 0
 
 
@@ -346,6 +399,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config", help="print the effective configuration").set_defaults(
         func=cmd_config
     )
+
+    sub.add_parser(
+        "doctor", help="check that the Docker daemon can run the configured runtime"
+    ).set_defaults(func=cmd_doctor)
     return parser
 
 
