@@ -60,6 +60,8 @@ def requests(draw):
 
 # ---------------------------------------------------------------------------- parse_head
 
+PROXY_ONLY = {"proxy-authorization", "proxy-connection"}
+
 
 def head_of(request: Request) -> bytes:
     lines = [f"{request.method} {request.target} {request.version}"]
@@ -94,9 +96,6 @@ def test_valid_heads_round_trip(request):
             b"",
         )
     )
-
-
-PROXY_ONLY = {"proxy-authorization", "proxy-connection"}
 
 
 def assert_canonical(request: Request) -> None:
