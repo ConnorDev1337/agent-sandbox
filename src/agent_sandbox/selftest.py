@@ -23,6 +23,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +47,7 @@ SYSCALLS = {
     "socket": (41, 198),
 }
 CLONE_NEWUSER = 0x10000000
+CLONE3 = 435  # Same number on x86_64 and aarch64
 AF_PACKET, SOCK_RAW = 17, 3
 # gVisor reports a made-up kernel build instead of the host's; recent releases
 # also end the release with "-gvisor" (e.g. "4.19.0-gvisor").
@@ -144,6 +146,24 @@ def _gvisor_kernel(args):
     shared = release == args.host_kernel
     detail = version + (f" (host: {args.host_kernel})" if args.host_kernel else "")
     return gvisor and not shared, detail
+
+
+@check("threads start (clone3 is refused with ENOSYS)")
+def _threads(_args):
+    # glibc tries clone3 first and falls back to clone only on ENOSYS, which is
+    # what the profile returns for clone3. A runtime that ignores the profile's
+    # errnoRet (gVisor before release-20261012) returns EPERM: no thread starts.
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    ctypes.set_errno(0)
+    libc.syscall(ctypes.c_long(CLONE3), None, ctypes.c_size_t(0))
+    clone3 = errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
+    thread = threading.Thread(target=lambda: None)
+    try:
+        thread.start()
+    except RuntimeError as exc:
+        return False, f"{exc}; clone3 failed with {clone3}"
+    thread.join()
+    return True, f"clone3 failed with {clone3}"
 
 
 @check("no direct route to the internet")

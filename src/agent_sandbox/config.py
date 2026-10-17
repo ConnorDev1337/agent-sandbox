@@ -121,6 +121,10 @@ class SandboxConfig:
         return self.state_dir / "compose.json"
 
     @property
+    def resolv_file(self) -> Path:
+        return self.state_dir / "resolv.conf"
+
+    @property
     def log_dir(self) -> Path:
         return self.state_dir / "logs"
 
