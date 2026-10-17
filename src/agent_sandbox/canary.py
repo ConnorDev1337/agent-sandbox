@@ -34,6 +34,7 @@ _WHITESPACE = b" \t\r\n\x0b\x0c"
 _SOFT_BREAK = re.compile(rb"=[ \t]*\r?\n")
 _ESCAPE = re.compile(rb"%[0-9a-f]{2}")  # in lowercased data
 SPAN = 3  # a match may span up to SPAN times its length (percent-encoding)
+MAX_HOLD = 64 * 1024  # bytes a StreamScanner holds back at most
 
 _ALNUM = string.ascii_letters + string.digits
 _UPPER = string.ascii_uppercase + string.digits
@@ -293,14 +294,17 @@ class CanaryMatcher:
 class StreamScanner:
     """Scan a byte stream piece by piece and release only data proven canary-free.
 
-    The last ``span - 1`` bytes are held back until more data (or the end of
-    the stream) arrives, so a canary split across pieces is caught before any
-    part of it is released.
+    The last bytes are held back until more data (or the end of the stream)
+    arrives: as many as it takes to leave ``span - 1`` once whitespace and soft
+    line breaks are removed, so a canary split across pieces is caught before
+    any part of it is released, however it is wrapped or padded, as long as it
+    spans at most MAX_HOLD bytes.
     """
 
     def __init__(self, matcher: CanaryMatcher) -> None:
         self._matcher = matcher
-        self._hold = max(matcher.span - 1, 0)
+        # One more than the span needs: a soft line break may end in the next piece.
+        self._hold = matcher.span
         self._tail = b""
 
     def feed(self, data: bytes) -> tuple[bytes, list[CanaryHit]]:
@@ -309,9 +313,34 @@ class StreamScanner:
         hits = self._matcher.scan(window)
         if hits:
             return b"", hits
-        cut = max(len(window) - self._hold, 0)
+        cut = len(window) - self._held(window)
         self._tail = window[cut:]
         return window[:cut], []
+
+    def _held(self, window: bytes) -> int:
+        """Return the length of the shortest end of ``window`` to hold back."""
+        limit = min(MAX_HOLD, len(window))
+
+        def enough(size: int) -> bool:
+            return len(_normalize(window[-size:])) >= self._hold
+
+        size = min(self._hold, limit)
+        if not size or enough(size):
+            return size
+        # The normalized length grows with the size: search exponentially, then
+        # by bisection, so that data without whitespace costs one normalization.
+        low, high = size + 1, min(2 * size, limit)
+        while not enough(high):
+            if high == limit:
+                return limit
+            low, high = high + 1, min(2 * high, limit)
+        while low < high:
+            middle = (low + high) // 2
+            if enough(middle):
+                high = middle
+            else:
+                low = middle + 1
+        return high
 
     def flush(self) -> bytes:
         """Release the held-back bytes at the end of the stream (already scanned)."""

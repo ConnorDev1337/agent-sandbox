@@ -220,6 +220,29 @@ def test_stream_scanner_finds_a_wrapped_canary_split_across_pieces(canaries, mat
     assert scanner.feed(wrapped[30:])[1][0].kind == "dotenv"
 
 
+@pytest.mark.parametrize(
+    "encode",
+    [
+        # Found by tests/test_fuzz_canary.py: the hold-back counted raw bytes, so
+        # a value spanning more than ``span`` of them once wrapped, padded or
+        # percent-encoded was released in part, then missed.
+        lambda s: _wrap("".join(f"%{b:02X}" for b in s.encode().hex().encode()), 4, "\r\n"),
+        lambda s: (" " * 8).join(s),
+        lambda s: "=\r\n= \n".join(s),
+    ],
+    ids=["percent-hex-wrapped", "padded", "soft-breaks"],
+)
+def test_stream_scanner_holds_back_padded_canaries(canaries, matcher, encode):
+    secret = _secret(canaries, "aws", 1)
+    data = b"&k=" + encode(secret).encode()
+    assert len(data) > matcher.span
+    for cut in range(1, len(data), 7):
+        scanner = StreamScanner(matcher)
+        released, hits = scanner.feed(data[:cut])
+        assert hits == [] and matcher.scan(released) == []
+        assert scanner.feed(data[cut:])[1][0].kind == "aws", cut
+
+
 def test_stream_scanner_releases_everything_eventually(matcher):
     scanner = StreamScanner(matcher)
     pieces = [bytes([65 + i % 26]) * 700 for i in range(20)]
