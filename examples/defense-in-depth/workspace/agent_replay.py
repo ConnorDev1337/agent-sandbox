@@ -76,7 +76,7 @@ def _run_hook(entry: dict, session: str, approvals: Path) -> dict:
         except (ValueError, KeyError):
             reason = proc.stdout.strip()
     return {
-        "tool": event.get("tool_name", event.get("hook_event_name")),
+        "tool": event.get("tool_name", ""),
         "event": event.get("hook_event_name"),
         "expect": entry.get("expect"),
         "decision": decision,
@@ -90,13 +90,11 @@ def _guard_phase(scenario: dict, approvals: Path, evidence: Path) -> list[dict]:
     session = scenario.get("session_id", "defense-in-depth-demo")
     results = [_run_hook(entry, session, approvals) for entry in scenario["events"]]
 
-    lines = ["# tool-call-guard decisions (balanced preset)\n"]
+    lines = ["# tool-call-guard decisions (balanced preset)", ""]
     for res in results:
-        lines.append(f"[{res['decision'].upper():7}] {res['event']} {res['tool']}")
-        for reason_line in res["reason"].splitlines():
-            lines.append(f"    {reason_line}")
-        lines.append("")
-    (evidence / "guard-decisions.txt").write_text("\n".join(lines), encoding="utf-8")
+        lines.append(f"[{res['decision'].upper():7}] {res['event']} {res['tool']}".rstrip())
+        lines.extend(f"    {reason_line}" for reason_line in res["reason"].splitlines())
+    (evidence / "guard-decisions.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (evidence / "guard-decisions.json").write_text(
         json.dumps(results, indent=2) + "\n", encoding="utf-8"
     )
@@ -112,6 +110,7 @@ def _guard_phase(scenario: dict, approvals: Path, evidence: Path) -> list[dict]:
     (evidence / "audit-verify.txt").write_text(verify.stdout + verify.stderr, encoding="utf-8")
     subprocess.run(  # noqa: S603 - fixed toolguard argv
         [*_toolguard_cmd(), "audit", "export", "-o", str(evidence / "audit.jsonl")],
+        capture_output=True,
         check=False,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -183,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     scenario = json.loads(Path(args.scenario).read_text(encoding="utf-8"))
     results = _guard_phase(scenario, Path(args.approvals), evidence)
     for res in results:
-        print(f"[{res['decision'].upper():7}] {res['event']} {res['tool']}")
+        print(f"[{res['decision'].upper():7}] {res['event']} {res['tool']}".rstrip())
 
     print("---")
     _sandbox_phase(evidence)
