@@ -584,6 +584,28 @@ def test_dns_alerts_are_debounced(canaries, log):
     assert len(read_jsonl(log.directory / "alerts.jsonl")) == 1
 
 
+def test_restricted_tunnel_answers_expect_continue(harness, upstream):
+    target = f"127.0.0.1:{upstream}"
+    h = harness(_restricted(upstream, {"methods": ["POST"]}))
+    with socket.create_connection(("127.0.0.1", h.port), timeout=5) as sock:
+        sock.sendall(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode())
+        assert sock.recv(4096).startswith(b"HTTP/1.1 200")
+        sock.sendall(
+            f"POST /x HTTP/1.1\r\nHost: {target}\r\nContent-Length: 5\r\n"
+            "Expect: 100-continue\r\n\r\n".encode()
+        )
+        assert sock.recv(4096) == b"HTTP/1.1 100 Continue\r\n\r\n"
+        sock.sendall(b"hello")
+        sock.shutdown(socket.SHUT_WR)
+        response = b""
+        with contextlib.suppress(OSError):
+            while data := sock.recv(4096):
+                response += data
+    assert response.endswith(b"hello from upstream")
+    (received,) = Upstream.received
+    assert received[2] == b"hello" and "Expect" not in received[3]
+
+
 def test_large_streamed_body_never_releases_a_late_canary(harness, upstream, canaries, log):
     secret = next(c for c in canaries if c.kind == "dotenv").secrets[1].encode()
     target = f"127.0.0.1:{upstream}"
