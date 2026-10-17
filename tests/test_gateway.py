@@ -154,8 +154,11 @@ def test_parse_helpers():
     assert split_host_port("example.com:8443", 443) == ("example.com", 8443)
     assert split_host_port("[::1]:80", 443) == ("::1", 80)
     assert split_host_port("example.com", 443) == ("example.com", 443)
-    with pytest.raises(ValueError):
-        split_host_port("not a host:1", 443)
+    # Found by tests/test_fuzz_allowlist.py: int() accepts signs, underscores,
+    # spaces and non-ASCII digits, and text after "]" was ignored.
+    for bad in ("not a host:1", "example.com:+443", "example.com:4_43", "[::1]x", "[::1"):
+        with pytest.raises(ValueError):
+            split_host_port(bad, 443)
 
 
 def test_plain_http_allowed_and_forwarded(harness, upstream, log):
