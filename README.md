@@ -50,6 +50,7 @@ skipped).
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Running a coding agent](#running-a-coding-agent)
+- [Defense in depth with tool-call-guard and mcp-security-scanner](#defense-in-depth-with-tool-call-guard-and-mcp-security-scanner)
 - [Configuration](#configuration)
 - [Security layers](#security-layers)
 - [Alerts](#alerts)
@@ -134,6 +135,23 @@ by digest), and the Compose file sets `NODE_USE_ENV_PROXY=1`, which Node.js 22.2
 to route `fetch` through `HTTPS_PROXY`. A custom `agent_image` with an older Node.js has `fetch`
 ignore the proxy and fail to resolve names. Claude Code and other Node.js clients trust the
 sandbox CA through `NODE_EXTRA_CA_CERTS` when TLS inspection is on.
+
+## Defense in depth with tool-call-guard and mcp-security-scanner
+
+The sandbox is the last line. [`examples/defense-in-depth/`](examples/defense-in-depth/README.md)
+is a scripted, reproducible demo of one prompt-injection attack (a poisoned MCP tool
+description and an attacker-written ticket that tell the agent to send `~/.aws/credentials` to
+an attacker's host) and of how three layers catch it independently:
+[mcp-security-scanner](https://github.com/ConnorDev1337/mcp-security-scanner) flags the
+poisoned definitions before the server is connected;
+[tool-call-guard](https://github.com/ConnorDev1337/tool-call-guard), driven through Claude
+Code's real hook protocol, blocks the send and holds the shell command for an out-of-band
+approval; and, with the guard bypassed, the sandbox raises the canary tripwire, refuses the
+attacker's host and blocks the canary sent to an allowlisted host over inspected HTTPS.
+
+```bash
+examples/defense-in-depth/run.sh     # or run.ps1; needs Docker and checkouts of the two tools
+```
 
 ## Configuration
 
@@ -670,8 +688,9 @@ docker rm -f -v agent-sandbox-e2e
 ```
 
 CI: [`.gitlab-ci.yml`](.gitlab-ci.yml) runs lint, unit tests on Python 3.11-3.13, the TLS tests
-against LibreSSL and validates the generated Compose file; the manual `gvisor-end-to-end` job runs the script above (it needs a
-privileged runner). The end-to-end test also runs in
+against LibreSSL and validates the generated Compose file (and the defense-in-depth demo's);
+the manual `gvisor-end-to-end` job runs the script above (it needs a privileged runner). The
+end-to-end test also runs in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (for a future GitHub mirror) and locally.
 
 ```text
@@ -689,7 +708,8 @@ src/agent_sandbox/
                       dns.py, tripwire.py, alerts.py
   docker/             agent.Dockerfile, gateway.Dockerfile (base images pinned by digest)
 tests/                unit tests for every module
-examples/             configuration for running Claude Code in the sandbox
+examples/             configuration for running Claude Code in the sandbox, and the
+                      defense-in-depth demo (scanner + guard + sandbox)
 scripts/e2e-dind.sh   end-to-end self-test under gVisor and runc in Docker-in-Docker
 ```
 
