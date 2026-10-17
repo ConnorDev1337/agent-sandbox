@@ -239,3 +239,28 @@ def test_compose_with_tls_inspection_keeps_the_ca_key_in_the_gateway(workspace):
     bundle = f"{compose.AGENT_TLS_DIR}/ca-bundle.crt"
     assert all(env[name] == bundle for name in compose.CA_BUNDLE_VARIABLES)
     assert env["NODE_EXTRA_CA_CERTS"] == f"{compose.AGENT_TLS_DIR}/ca.crt"
+
+
+def test_runtime_defaults_to_runc_and_gateway_stays_on_runc(workspace):
+    config = load(workspace)
+    assert config.runtime == "runc"
+    services = compose.build(config)["services"]
+    assert services["agent"]["runtime"] == "runc"
+    assert services["gateway"]["runtime"] == compose.GATEWAY_RUNTIME == "runc"
+
+
+def test_runsc_runtime_keeps_the_seccomp_profile(workspace):
+    write_config(workspace, '[sandbox]\nruntime = "runsc"\n')
+    services = compose.build(load(workspace))["services"]
+    agent = services["agent"]
+    assert agent["runtime"] == "runsc" and services["gateway"]["runtime"] == "runc"
+    # gVisor enforces the profile itself (runsc --oci-seccomp): defence in depth.
+    assert any(opt.startswith("seccomp=") for opt in agent["security_opt"])
+    assert agent["cap_drop"] == ["ALL"] and agent["read_only"] is True
+
+
+@pytest.mark.parametrize("value", ['"kata"', '"RUNSC"', "1"])
+def test_invalid_runtime(workspace, value):
+    write_config(workspace, f"[sandbox]\nruntime = {value}\n")
+    with pytest.raises(ConfigError, match=r"sandbox\.runtime must be one of: runc, runsc"):
+        load(workspace)
