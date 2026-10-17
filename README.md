@@ -361,7 +361,9 @@ inside a VM that Docker Desktop manages. Use Docker Engine on a Linux host
   so an allowlisted name that resolves to a private, loopback, link-local or cloud-metadata
   address is refused (DNS rebinding). For TLS tunnels, the server name in the ClientHello must
   match the `CONNECT` target; the whole ClientHello is reassembled first, so splitting it across
-  packets or TLS records does not hide the name. In every request the gateway can read, the
+  packets or TLS records does not hide the name, and a ClientHello the gateway cannot parse
+  strictly (over 64 KiB, inconsistent lengths, duplicate extensions, several server names) is
+  refused, so a server never reads a name the gateway did not check. In every request the gateway can read, the
   `Host` header (and an absolute request target) must name the destination too, so a shared
   front end (CDN, load balancer) cannot be used to reach another backend (domain fronting).
 - **Plaintext tunnels**: a non-TLS `CONNECT` tunnel that starts with an HTTP/1 request (Node's
@@ -549,6 +551,7 @@ $ agent-sandbox alerts
 | `canary.dns` | critical | A canary value was encoded in a DNS query |
 | `canary.file_access` | warning | A canary file was opened |
 | `egress.sni_mismatch` | warning | TLS server name differs from the `CONNECT` target |
+| `egress.malformed_hello` | warning | A TLS ClientHello could not be parsed strictly (oversized, two server names...) and was refused |
 | `egress.host_mismatch` | warning | A request's `Host` header names another host than its connection |
 | `egress.private_address` | warning | An allowlisted name resolved only to non-public addresses |
 | `egress.undecodable_body` | warning | A request body could not be decoded for scanning and was refused |

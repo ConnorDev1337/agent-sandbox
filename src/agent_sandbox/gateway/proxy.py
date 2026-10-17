@@ -46,11 +46,12 @@ from .http1 import (
 )
 from .tls import (
     NO_APPLICATION_PROTOCOL,
+    MalformedHello,
     TLSServerSession,
     alpn_protocols,
     hello_complete,
     looks_like_tls,
-    server_name,
+    parse_client_hello,
 )
 
 __all__ = ["MAX_HEAD", "Proxy", "ProxyError", "Request", "parse_head", "serve", "split_host_port"]
@@ -402,7 +403,24 @@ class Proxy:
         passthrough = False
         if tls:
             first = await self._read_hello(reader, first)
-            sni = server_name(first)
+            if not hello_complete(first):
+                upstream_writer.close()  # The client left before its ClientHello was sent
+                return
+            try:
+                sni = parse_client_hello(first).server_name
+            except MalformedHello as exc:
+                # The server could read a server name the gateway cannot check
+                # (a ClientHello over MAX_HELLO bytes, two names...).
+                self.log.alert(
+                    "egress.malformed_hello",
+                    "warning",
+                    f"TLS ClientHello to {host} refused: {exc}",
+                    host=host,
+                    reason=str(exc),
+                    client=client,
+                )
+                upstream_writer.close()
+                return
             if sni is not None and sni != host:
                 self.log.alert(
                     "egress.sni_mismatch",

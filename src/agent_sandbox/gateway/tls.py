@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import ssl
 import struct
+from dataclasses import dataclass
 
 _HANDSHAKE = 0x16
 _READ_SIZE = 64 * 1024
@@ -55,63 +56,128 @@ def hello_complete(data: bytes) -> bool:
     return False
 
 
-def _extension(data: bytes, wanted: int) -> bytes | None:
-    """Return the body of the first ClientHello extension of type ``wanted``, if any."""
+class MalformedHello(ValueError):
+    """The stream does not start with one complete, well-formed ClientHello."""
+
+
+@dataclass(frozen=True)
+class ClientHello:
+    server_name: str | None  # lowercased; None when the client sends no SNI
+    alpn: tuple[str, ...] | None  # None when the client offers no ALPN
+
+
+class _Fields:
+    """Cursor over TLS presentation-language fields; short reads are malformed."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+
+    @property
+    def remaining(self) -> int:
+        return len(self._data) - self._pos
+
+    def take(self, size: int) -> bytes:
+        if size > self.remaining:
+            raise MalformedHello("truncated ClientHello")
+        self._pos += size
+        return self._data[self._pos - size : self._pos]
+
+    def number(self, size: int) -> int:
+        return int.from_bytes(self.take(size), "big")
+
+    def vector(self, length_size: int) -> bytes:
+        return self.take(self.number(length_size))
+
+    def end(self, what: str) -> None:
+        if self.remaining:
+            raise MalformedHello(f"trailing data after the {what}")
+
+
+def parse_client_hello(data: bytes) -> ClientHello:
+    """Parse the ClientHello at the start of a TLS stream, strictly.
+
+    Anything a TLS server could read differently from the gateway raises
+    :class:`MalformedHello`: an incomplete or oversized message, inconsistent
+    lengths, duplicate extensions, or a server name list with anything but a
+    single non-empty ASCII host name. The gateway refuses such connections, so
+    a server name it cannot check never reaches a server that could read one.
+    """
     message = handshake_message(data) if looks_like_tls(data) else None
-    try:
-        if message is None or message[0] != _CLIENT_HELLO:
-            return None
-        pos = 4  # handshake header
-        pos += 2 + 32  # client_version, random
-        pos += 1 + message[pos]  # session_id
-        (suites_len,) = struct.unpack_from("!H", message, pos)
-        pos += 2 + suites_len
-        pos += 1 + message[pos]  # compression_methods
-        (extensions_len,) = struct.unpack_from("!H", message, pos)
-        pos += 2
-        end = min(pos + extensions_len, len(message))
-        while pos + 4 <= end:
-            ext_type, ext_len = struct.unpack_from("!HH", message, pos)
-            pos += 4
-            if ext_type == wanted:
-                return message[pos : pos + ext_len]
-            pos += ext_len
-    except (IndexError, struct.error):
+    if message is None:
+        raise MalformedHello("no complete ClientHello")
+    if message[0] != _CLIENT_HELLO:
+        raise MalformedHello("the first handshake message is not a ClientHello")
+    fields = _Fields(message[4:])
+    fields.take(2 + 32)  # legacy_version, random
+    if len(fields.vector(1)) > 32:
+        raise MalformedHello("session id longer than 32 bytes")
+    suites = fields.vector(2)
+    if not suites or len(suites) % 2:
+        raise MalformedHello("malformed cipher suite list")
+    if not fields.vector(1):
+        raise MalformedHello("no compression method")
+    extensions: dict[int, bytes] = {}
+    if fields.remaining:  # Extensions are optional before TLS 1.3
+        block = _Fields(fields.vector(2))
+        fields.end("extensions")
+        while block.remaining:
+            kind, body = block.number(2), block.vector(2)
+            if kind in extensions:
+                raise MalformedHello(f"duplicate extension {kind}")
+            extensions[kind] = body
+    return ClientHello(_host_name(extensions.get(_SERVER_NAME)), _protocols(extensions.get(_ALPN)))
+
+
+def _host_name(extension: bytes | None) -> str | None:
+    if extension is None:
         return None
-    return None
+    fields = _Fields(extension)
+    names = _Fields(fields.vector(2))
+    fields.end("server name list")
+    if not names.remaining:
+        raise MalformedHello("empty server name list")
+    if names.number(1) != 0:  # host_name, the only name type (RFC 6066)
+        raise MalformedHello("unknown server name type")
+    name = names.vector(2)
+    names.end("host name")  # One name only: servers disagree on which one counts
+    if not name or not name.isascii() or b"\0" in name:
+        raise MalformedHello("invalid server name")
+    return name.decode("ascii").lower()
+
+
+def _protocols(extension: bytes | None) -> tuple[str, ...] | None:
+    if extension is None:
+        return None
+    fields = _Fields(extension)
+    names = _Fields(fields.vector(2))
+    fields.end("ALPN protocol list")
+    protocols = []
+    while names.remaining:
+        name = names.vector(1)
+        if not name:
+            raise MalformedHello("empty ALPN protocol name")
+        protocols.append(name.decode("ascii", "replace"))
+    if not protocols:
+        raise MalformedHello("empty ALPN protocol list")
+    return tuple(protocols)
 
 
 def server_name(data: bytes) -> str | None:
     """Return the SNI host name of a ClientHello, or ``None`` if absent or unparsable."""
-    extension = _extension(data, _SERVER_NAME)
     try:
-        if extension is None:
-            return None
-        (list_len,) = struct.unpack_from("!H", extension)
-        cursor, list_end = 2, 2 + list_len
-        while cursor + 3 <= list_end:
-            name_type, name_len = struct.unpack_from("!BH", extension, cursor)
-            cursor += 3
-            if name_type == 0:
-                return extension[cursor : cursor + name_len].decode("ascii").lower()
-            cursor += name_len
-    except (IndexError, struct.error, UnicodeDecodeError):
+        return parse_client_hello(data).server_name
+    except MalformedHello:
         return None
-    return None
 
 
 def alpn_protocols(data: bytes) -> list[str] | None:
-    """Return the ALPN protocols a ClientHello offers, or ``None`` if it offers none."""
-    extension = _extension(data, _ALPN)
-    if extension is None or len(extension) < 2:
+    """Return the ALPN protocols a ClientHello offers, or ``None`` if none or unparsable."""
+    try:
+        protocols = parse_client_hello(data).alpn
+    except MalformedHello:
         return None
-    names = []
-    cursor, end = 2, min(2 + int.from_bytes(extension[:2], "big"), len(extension))
-    while cursor < end:
-        size = extension[cursor]
-        names.append(extension[cursor + 1 : cursor + 1 + size].decode("ascii", "replace"))
-        cursor += 1 + size
-    return names
+    return None if protocols is None else list(protocols)
 
 
 class TLSServerSession:

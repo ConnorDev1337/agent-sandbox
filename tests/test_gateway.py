@@ -19,7 +19,14 @@ from agent_sandbox.canary import CanaryMatcher, generate
 from agent_sandbox.gateway import dns
 from agent_sandbox.gateway.alerts import EventLog
 from agent_sandbox.gateway.proxy import Proxy, parse_head, split_host_port
-from agent_sandbox.gateway.tls import MAX_HELLO, alpn_protocols, hello_complete, server_name
+from agent_sandbox.gateway.tls import (
+    MAX_HELLO,
+    MalformedHello,
+    alpn_protocols,
+    hello_complete,
+    parse_client_hello,
+    server_name,
+)
 from agent_sandbox.gateway.tripwire import Tripwire, parse_events, seed
 
 
@@ -569,6 +576,64 @@ def test_sni_check_survives_split_hello(harness, upstream, log):
                 pass
     (alert,) = read_jsonl(log.directory / "alerts.jsonl")
     assert alert["kind"] == "egress.sni_mismatch" and alert["sni"] == "evil.example"
+
+
+def _extension(kind: int, body: bytes) -> bytes:
+    return struct.pack("!HH", kind, len(body)) + body
+
+
+def _names(*names: bytes) -> bytes:
+    entries = b"".join(struct.pack("!BH", 0, len(n)) + n for n in names)
+    return _extension(0, struct.pack("!H", len(entries)) + entries)
+
+
+def _hello_records(extensions: bytes, suites: int = 1, size: int = 16384) -> bytes:
+    """A ClientHello with these extensions, in TLS records of at most ``size`` bytes."""
+    body = b"\x03\x03" + b"\0" * 32 + b"\x00" + struct.pack("!H", 2 * suites)
+    body += b"\x13\x01" * suites + b"\x01\x00"
+    body += struct.pack("!H", len(extensions)) + extensions
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"".join(
+        b"\x16\x03\x01" + struct.pack("!H", len(part)) + part
+        for part in (handshake[i : i + size] for i in range(0, len(handshake), size))
+    )
+
+
+@pytest.mark.parametrize(
+    "extensions",
+    [
+        # Found by tests/test_fuzz_tls.py: the gateway read the first name or
+        # extension, a server may read the other one.
+        _names(b"pypi.org", b"evil.example"),
+        _names(b"pypi.org") + _names(b"evil.example"),
+        _names(b"pypi.org") + b"\x00",
+        _names(b"pypi.org")[:-1] + b"\x00\x00",
+        _names(b""),
+        _names(b"pypi.org") + _extension(16, b"\x00\x03\x00\x02h2"),
+    ],
+)
+def test_ambiguous_hellos_are_malformed(extensions):
+    with pytest.raises(MalformedHello):
+        parse_client_hello(_hello_records(extensions))
+    assert server_name(_hello_records(extensions)) is None
+
+
+@pytest.mark.parametrize(
+    "hello",
+    [
+        # Found by tests/test_fuzz_tls.py: a ClientHello over MAX_HELLO bytes, or
+        # with two names, was relayed without a server name check (OpenSSL
+        # servers accept ClientHellos up to 128 KiB).
+        _hello_records(_extension(21, b"\0" * 50000) + _names(b"evil.example"), suites=10000),
+        _hello_records(_names(b"127.0.0.1", b"evil.example")),
+    ],
+    ids=["oversized", "two-names"],
+)  # fmt: skip
+def test_unparsable_hellos_are_refused(harness, upstream, log, hello):
+    h = harness([f"127.0.0.1:{upstream}"])
+    h.raw(f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode(), read_after=hello)
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["kind"] == "egress.malformed_hello" and alert["host"] == "127.0.0.1"
 
 
 def test_dns_sinkhole(canaries, log):
