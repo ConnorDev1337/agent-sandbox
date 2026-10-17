@@ -103,6 +103,16 @@ def test_write_compose_produces_valid_json(demo, tmp_path, monkeypatch):
     assert json.loads(config.gateway_file.read_text(encoding="utf-8"))["tls_inspect"] is True
 
 
+def test_compose_only_needs_neither_docker_nor_checkouts(demo, tmp_path, capsys):
+    out = tmp_path / "out"
+    missing = str(tmp_path / "missing")
+    assert demo.main(["--compose-only", "--out", str(out), "--scanner-src", missing]) == 0
+    path = Path(capsys.readouterr().out.strip())
+    assert path.is_relative_to(out / "state") and path.is_file()
+    assert (out / "workspace" / "scenario.json").is_file()
+    assert json.loads(path.read_text(encoding="utf-8"))["services"]["agent"]["labels"]
+
+
 def test_sanitize_masks_values_that_change_between_runs(demo):
     text = (
         "[2026-10-17T07:55:45] toolguard: approval 3eda1497 for Bash\n"
