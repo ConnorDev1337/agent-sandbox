@@ -478,7 +478,9 @@ class Proxy:
     ) -> None:
         """Relay parsed requests upstream and raw responses back until either side ends."""
         relay = asyncio.ensure_future(
-            self._relay_requests(source, upstream_writer, host, port, client, tls=tls)
+            self._relay_requests(
+                source, client_writer, upstream_writer, host, port, client, tls=tls
+            )
         )
         pump = asyncio.ensure_future(
             self._pump(upstream_reader, client_writer, client, host, scan=False)
@@ -527,6 +529,7 @@ class Proxy:
     async def _relay_requests(
         self,
         source: BufferedReader,
+        client_writer: Sink,
         upstream: asyncio.StreamWriter,
         host: str,
         port: int,
@@ -551,6 +554,12 @@ class Proxy:
             if request.header("upgrade") is not None:
                 raise ProxyError(501, "protocol upgrades are not supported by the gateway")
             length = body_length(request)
+            if (request.header("expect") or "").lower() == "100-continue":
+                # The head is held until the body is scanned, so the server cannot
+                # send the interim response; the gateway does, and drops the header.
+                request.headers = [(k, v) for k, v in request.headers if k.lower() != "expect"]
+                client_writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                await client_writer.drain()
             await self._relay_body(
                 source, upstream, serialize_head(request), length, host, client, tls=tls
             )
