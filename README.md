@@ -195,7 +195,9 @@ webhook = "https://hooks.slack.com/services/..."   # optional
 ```
 
 Allowlist entries are exact host names, `*.domain` for strict subdomains, or `host:port`. IP
-literals are only allowed when listed explicitly.
+literals are only allowed when listed explicitly. Names are ASCII (internationalized names in
+punycode, `xn--...`) and matched without regard to case or a trailing dot; names ending with a
+numeric label, which resolvers read as IPv4 addresses (`127.1`), are refused.
 
 An entry can also be a table that limits what may be sent to the host, or exempts it from TLS
 inspection:
@@ -212,8 +214,10 @@ destination, a request to it must be permitted by at least one such entry, whate
 entries (including the defaults) say. Several tables for the same host add up, which is how the
 example above keeps `git clone` and `git fetch` working (they POST to `git-upload-pack`) while
 `git push` (`git-receive-pack`), gists, issues and other writes are refused. A path containing
-dot segments, `//`, a backslash or an encoded `/`, `.` or `\` never matches a path pattern,
-because servers may normalize it differently.
+dot segments (also as `..;x`, `..%20` or `.. .`, which Tomcat and Windows servers read as `..`),
+`//`, a backslash, a fragment, whitespace or control characters, non-ASCII bytes, escapes that
+are not valid UTF-8 (overlong `%c0%ae`), `%u` escapes or an encoded `/`, `\`, `.`, `;`, `#`, `?`,
+`%` or NUL never matches a path pattern, because servers may normalize it differently.
 
 The gateway can only enforce these rules on requests it can read: always for plain HTTP, and for
 HTTPS only with `tls_inspect = true`. Without inspection, HTTPS tunnels to a restricted host are
@@ -371,8 +375,13 @@ inside a VM that Docker Desktop manages. Use Docker Engine on a Linux host
   and path rules, the `Host` check and body decoding apply. Other plaintext protocols are relayed
   as a byte stream and scanned as is.
 - **Strict request parsing**: requests the gateway forwards are parsed strictly (no bare CR or LF,
-  no whitespace before a colon, no conflicting `Content-Length` and `Transfer-Encoding`, no exotic
-  chunk sizes), so the gateway and the server cannot disagree about where a request ends.
+  no control characters, no whitespace before a colon, no conflicting `Content-Length` and
+  `Transfer-Encoding`, a `Content-Length` of ASCII digits and exactly `chunked` as
+  `Transfer-Encoding`, none in HTTP/1.0, no exotic chunk sizes, a request target of visible
+  ASCII without a fragment), so the gateway and the server cannot disagree about where a
+  request ends. In a plaintext tunnel, anything a lenient server could take for a request
+  (after empty lines, with a tab after the method) is parsed, and refused, rather than relayed
+  unread.
 - **DNS sinkhole**: every external lookup is answered `NXDOMAIN` and logged. The agent never needs
   DNS for the internet because the proxy resolves names; this closes DNS tunnelling.
 
@@ -511,7 +520,8 @@ They are detected:
   base32/hex split across DNS labels;
 - **wrapped**: whitespace and quoted-printable soft line breaks are ignored (the output of
   `base64`, MIME parts with `Content-Transfer-Encoding`, hex dumps), and data around percent
-  escapes is also searched percent-decoded (partial or excessive URL encoding);
+  escapes is also searched percent-decoded (partial or excessive URL encoding), however the
+  data is split into reads, as long as a value spans at most 64 KiB once wrapped or padded;
 - with an inotify **tripwire** on the files themselves: opening a canary file raises a warning
   (except `~/.netrc`, which curl and git read on their own).
 
@@ -662,6 +672,20 @@ python -m agent_sandbox.seccomp --check   # profile matches the generator
 agent-sandbox -w /tmp/demo verify --build # end-to-end on a real Docker daemon
 ```
 
+The security-critical parsers (HTTP/1 framing, Content-Encoding decoding, canary matching and
+the stream scanner, ClientHello parsing, allowlist host and path matching) also have
+property-based tests, `tests/test_fuzz_*.py`, written with
+[Hypothesis](https://hypothesis.readthedocs.io/). They run a few dozen examples each with the
+rest of the suite; the `fuzz` profile runs about 4,000 per property (a few minutes per file):
+
+```bash
+HYPOTHESIS_PROFILE=fuzz pytest tests/test_fuzz_*.py
+```
+
+A failure prints the smallest example found and a `@reproduce_failure` decorator; examples that
+failed are replayed first on the next run (from `.hypothesis/`). Each bug they found is also kept
+as a plain regression test next to the module's unit tests.
+
 The certificate tests run once per OpenSSL-compatible binary they find: `openssl` on the `PATH`,
 `/usr/bin/openssl` (LibreSSL on macOS) and every binary listed in `OPENSSL` (separated like
 `PATH`), which must exist. On Alpine, for example:
@@ -710,7 +734,7 @@ src/agent_sandbox/
                       certs.py (CA and leaf certificates), decoding.py (Content-Encoding),
                       dns.py, tripwire.py, alerts.py
   docker/             agent.Dockerfile, gateway.Dockerfile (base images pinned by digest)
-tests/                unit tests for every module
+tests/                unit tests for every module, property-based tests (test_fuzz_*.py)
 examples/             configuration for running Claude Code in the sandbox, and the
                       defense-in-depth demo (scanner + guard + sandbox)
 scripts/e2e-dind.sh   end-to-end self-test under gVisor and runc in Docker-in-Docker
