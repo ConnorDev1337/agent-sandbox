@@ -264,3 +264,28 @@ def test_invalid_runtime(workspace, value):
     write_config(workspace, f"[sandbox]\nruntime = {value}\n")
     with pytest.raises(ConfigError, match=r"sandbox\.runtime must be one of: runc, runsc"):
         load(workspace)
+
+
+def test_runsc_agent_resolves_names_through_the_gateway_only(workspace):
+    write_config(workspace, '[sandbox]\nruntime = "runsc"\n')
+    config = load(workspace)
+    agent = compose.build(config)["services"]["agent"]
+    mounts = {m["target"]: m for m in agent["volumes"]}
+    assert mounts["/etc/resolv.conf"] == {
+        "type": "bind",
+        "source": str(config.resolv_file),
+        "target": "/etc/resolv.conf",
+        "read_only": True,
+    }
+    compose.write(config)
+    resolv = config.resolv_file.read_bytes().decode("ascii")
+    assert resolv.splitlines()[1:] == ["nameserver 172.31.250.2", "options ndots:0"]
+    assert "\r" not in resolv
+
+
+def test_runc_agent_keeps_dockers_resolver(workspace):
+    config = load(workspace)
+    compose.write(config)
+    agent = compose.build(config)["services"]["agent"]
+    assert "/etc/resolv.conf" not in {m["target"] for m in agent["volumes"]}
+    assert not config.resolv_file.exists()

@@ -20,7 +20,9 @@
 set -eu
 
 SOURCE_DIR="$(cd "${1:-.}" && pwd)"
-GVISOR_VERSION="${GVISOR_VERSION:-20260928.0}"
+# The first release that honours errnoRet in OCI seccomp profiles: older ones
+# return EPERM for clone3 instead of ENOSYS, and glibc then cannot start threads.
+GVISOR_VERSION="${GVISOR_VERSION:-20261012.0}"
 GVISOR_CACHE="${GVISOR_CACHE:-/var/cache/gvisor}"
 GVISOR_PLATFORM="${GVISOR_PLATFORM:-systrap}"
 RUNTIMES="${RUNTIMES-runsc runc}"
@@ -31,11 +33,11 @@ WORK_DIR="${WORK_DIR:-/tmp/agent-sandbox-e2e}"
 case "$(uname -m)" in
     x86_64)
         ARCH=x86_64
-        GVISOR_SHA512=4ce35ca83aef7f96b06cde668e0b23aa98b05aa1829508e974196c2a1e02786c95f5bf79315fd7ddcfd88fe7a00f083ed8053e25eff7673d28d5256440caae8b
+        GVISOR_SHA512=ce2e1aeb853c104e854dea6644333a1dba0fbc9dd1646af97e1d013fdf810da6d4176dd96f2139d7b055e5382117c0d7c4567ebd64ed9bef47fdd15f80fd67ab
         ;;
     aarch64)
         ARCH=aarch64
-        GVISOR_SHA512=31519c2c8476c6eb24f51aa1378e555b4e86883dc1c8d81fb82df1af1900f38b10149affaa05bcc2418e57989bd04a33603a10ac73fee92e0fe20aef44e402e3
+        GVISOR_SHA512=3459ca3e496465e5b6a1318563ede4bb079bdf11ae93f4bb8d71df3cd2f19bfa6db7c1035d2f9e97b4f4e57c298a4f18b42af7297c048ec7e14ec819223684e4
         ;;
     *)
         echo "unsupported architecture: $(uname -m)" >&2

@@ -257,3 +257,30 @@ def test_read_only_root_check(monkeypatch, tmp_path, error, read_only, ok):
 
     monkeypatch.setattr(selftest, "open", fake_open, raising=False)
     assert selftest._read_only_root(None)[0] is ok
+
+
+class _FakeLibc:
+    def __init__(self, error):
+        self.error = error
+
+    def syscall(self, *args):
+        selftest.ctypes.set_errno(self.error)
+        return -1
+
+
+def test_thread_check(monkeypatch):
+    monkeypatch.setattr(selftest.ctypes, "CDLL", lambda *a, **k: _FakeLibc(errno.ENOSYS))
+    ok, detail = selftest._threads(None)
+    assert ok is True and "ENOSYS" in detail
+
+    class NoThreads:
+        def __init__(self, target):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(selftest.ctypes, "CDLL", lambda *a, **k: _FakeLibc(errno.EPERM))
+    monkeypatch.setattr(selftest.threading, "Thread", NoThreads)
+    ok, detail = selftest._threads(None)
+    assert ok is False and "can't start new thread" in detail and "EPERM" in detail
