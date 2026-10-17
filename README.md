@@ -5,7 +5,8 @@ tightened seccomp profile and a read-only root filesystem; its only way out is a
 enforces a domain **allowlist** (optionally down to HTTP methods and paths); and its home
 directory is seeded with **canary credentials** that raise an alert the moment they show up in
 outbound traffic or DNS queries. With the opt-in **TLS inspection**, that includes the bodies of
-HTTPS requests to allowlisted hosts.
+HTTPS requests to allowlisted hosts. With the opt-in **gVisor** runtime, the agent's system calls
+are served by a user-space kernel instead of the host's.
 
 ```text
 $ agent-sandbox verify          # with tls_inspect = true and a read-only rule for github.com
@@ -14,6 +15,8 @@ PASS  no capabilities                                               CapEff=00000
 PASS  no_new_privs and seccomp filter active                        NoNewPrivs=1 Seccomp=2
 PASS  root filesystem is read-only                                  Read-only file system
 PASS  dangerous syscalls return EPERM                               all blocked
+SKIP  agent runs on gVisor's kernel, not the host's                 runtime is runc, not runsc
+PASS  threads start (clone3 is refused with ENOSYS)                 clone3 failed with ENOSYS
 PASS  no direct route to the internet                               Network is unreachable
 PASS  host is unreachable on the sandbox network                    no answer from 172.31.250.1
 PASS  external DNS is sinkholed                                     [Errno -2] Name or service not known
@@ -33,11 +36,11 @@ PASS  gateway raised a canary.dns alert                             found
 PASS  gateway raised a canary.file_access alert                     found
 PASS  gateway raised a canary.exfiltration alert for decrypted TLS  found
 
-23/23 checks passed
+24/24 checks passed, 1 skipped (not enabled in this configuration)
 ```
 
 Checks that the configuration does not enable are reported as `SKIP` (with the defaults:
-18 checks pass and the four TLS inspection and method rule checks are skipped).
+19 checks pass and the five TLS inspection, method rule and gVisor checks are skipped).
 
 ## Contents
 
@@ -99,6 +102,7 @@ agent-sandbox down                    # stop (add --volumes to wipe the agent's 
 | `alerts [--events] [--json] [--fail]` | Alerts (or every gateway decision); `--fail` exits 1 on critical alerts |
 | `verify [--build] [--no-up]` | Run the in-container self-test and check the expected alerts |
 | `config` | Effective configuration and paths |
+| `doctor` | Check that the Docker daemon can run the configured runtime (`docker info`) |
 | `down [--volumes]` | Stop the sandbox |
 
 ## Running a coding agent
@@ -136,6 +140,7 @@ sandbox CA through `NODE_EXTRA_CA_CERTS` when TLS inspection is on.
 [sandbox]
 name = "my-project"                 # default: directory name
 # agent_image = "my-registry/agent:1.0"  # custom image (must provide uid 1000)
+runtime = "runc"                    # "runsc": run the agent under gVisor (see below)
 
 [network]
 allow = [
@@ -228,6 +233,90 @@ the default it:
 - restricts `socket(2)` to `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`.
 
 Debuggers such as `gdb` and `strace` do not work inside the sandbox as a result.
+
+### gVisor (optional)
+
+With `[sandbox] runtime = "runsc"` the agent container runs under [gVisor](https://gvisor.dev):
+its system calls are served by gVisor's user-space kernel (the Sentry, written in Go) instead of
+the host kernel. The Sentry runs under its own strict seccomp filter and needs far fewer host
+system calls than the agent's programs would, so a kernel exploit has to break gVisor first.
+
+```toml
+[sandbox]
+runtime = "runsc"     # default: "runc"
+```
+
+- **The seccomp profile still applies.** runsc ignores a container's seccomp profile unless it
+  runs with `--oci-seccomp`; with that flag, the Sentry enforces the profile on the agent's
+  processes. It stays on as defence in depth: system calls that gVisor implements itself
+  (`ptrace`, `unshare`, `mount`, `keyctl`...) remain out of the agent's reach, so a bug in their
+  implementation cannot be used against the Sentry, and the self-test means the same under both
+  runtimes. `up`, `verify` and `doctor` read `docker info` and refuse to start when runsc is
+  missing or registered without `--oci-seccomp`; they never fall back to runc. (When runsc is
+  configured as a containerd shim, Docker does not report its flags: you get a warning, and the
+  `dangerous syscalls return EPERM` check is what tells.)
+- **gVisor release 20261012.0 or later.** Older releases ignore the `errnoRet` of OCI profile
+  rules, so `clone3` fails with `EPERM` instead of `ENOSYS`, glibc does not fall back to `clone`,
+  and no program can start a thread (Python raises `can't start new thread`, Node.js aborts).
+  The `threads start` check catches it.
+- **The gateway always runs under runc**, whatever the daemon's default runtime. Under runsc it
+  breaks twice (tested with `verify`): gVisor's inotify only reports accesses made inside the
+  same sandbox, so the tripwire never sees the agent open a canary file (no
+  `canary.file_access` alert), and the gateway cannot resolve allowlisted names through
+  Docker's embedded DNS server (see the next point), so every request fails with `502`. The
+  gateway is trusted code that never runs anything from the agent, and it keeps its own
+  hardening (no capabilities beyond the four it needs, read-only root, Docker's default seccomp
+  profile).
+- **DNS**: gVisor's network stack does not see the NAT rules that send `127.0.0.11` to Docker's
+  embedded DNS server, so every lookup would time out and DNS tunnelling would go unnoticed.
+  Under runsc the agent gets a read-only `/etc/resolv.conf` that points at the gateway's
+  sinkhole instead.
+- `verify` adds a check that the agent sees gVisor's kernel (`/proc/version`, release
+  `4.19.0-gvisor`) and not the host's release. Like gVisor's own `dmesg` banner, it confirms
+  the configuration; it is not a security boundary.
+
+To install gVisor on a Linux host, follow the
+[installation guide](https://gvisor.dev/docs/user_guide/install/) (apt repository, or the
+release tarball checked against its `.sha512`), then register it with the flag and check:
+
+```bash
+sudo runsc install -- --oci-seccomp     # adds or updates the "runsc" entry in /etc/docker/daemon.json
+sudo systemctl reload docker
+agent-sandbox doctor                    # ends with: agent      runsc: ok
+agent-sandbox verify --build
+```
+
+The apt package registers runsc on its own, without extra flags: run `runsc install` as above
+afterwards. Other runsc flags (`--platform=kvm` on hosts with `/dev/kvm`, for example) go after
+`--` in the same command.
+
+**Compatibility and performance.** Under gVisor every system call costs more, and file system
+and network operations go through the Sentry: builds, package installs and test suites that
+start many processes are noticeably slower, while CPU-bound work runs at close to native speed. Indicative
+timings from the end-to-end environment below (ptrace platform, which is slower than the
+default systrap):
+
+| Inside the agent container | runc | runsc (ptrace) |
+|---|---|---|
+| `python3 -c pass`, 20 times | 0.40 s | 1.80 s |
+| `node -e 0`, 10 times | 1.05 s | 2.79 s |
+| `find /usr -type f` | 0.06 s | 2.87 s |
+| fork and exec `/bin/true`, 500 times | 0.87 s | 9.52 s |
+| write 200 MiB to the `/tmp` tmpfs | 0.16 s | 0.25 s |
+
+Most build and language tooling works: besides the self-test (Python and Node.js 22),
+`git clone`, `pip install` and `npm install` through the gateway were checked under runsc. Programs that need system calls or `/proc` and `/sys` files gVisor does not
+implement fail, see gVisor's [compatibility notes](https://gvisor.dev/docs/user_guide/compatibility/).
+`/proc/version` and `uname` report gVisor's kernel, and a non-root write to a read-only path
+fails with `EACCES` rather than `EROFS`.
+
+**Docker Desktop.** Not supported. Docker Desktop's VM (WSL2 backend on Windows) runs every
+process under a seccomp filter that already has a user-notification listener; gVisor's default
+platform, systrap, needs a listener of its own, which the kernel refuses (`EBUSY`), and the
+sandbox dies with `failed to create a syscall thread`. The ptrace platform works there but is
+slow, the VM has no `/dev/kvm` for the KVM platform, and the runsc binary would have to live
+inside a VM that Docker Desktop manages. Use Docker Engine on a Linux host
+(or VM) for gVisor.
 
 ### Network
 
@@ -419,13 +508,24 @@ inside the agent container is not.
 | DNS tunnelling | DNS sinkhole |
 | Credential harvesting and exfiltration of credentials | Canary tokens: tripwire on access, block and alert on egress |
 | Reaching host or LAN services | No route, no host address on the bridge, private addresses refused by the gateway |
-| Container escape via kernel interfaces | Capabilities dropped, no-new-privileges, seccomp |
+| Container escape via kernel interfaces | Capabilities dropped, no-new-privileges, seccomp; with `runtime = "runsc"`, gVisor's user-space kernel between the agent and the host kernel |
 | Persistence in the image | Read-only root filesystem |
 | Code that later runs on the host | `.git/hooks` and `.git/config` read-only |
 | Resource exhaustion | CPU, memory, PID and file descriptor limits |
 
-**Out of scope**: kernel vulnerabilities (the container shares the host kernel), a compromised
-Docker daemon, and what the user does with the code afterwards.
+**Kernel attack surface**:
+
+| | `runtime = "runc"` (default) | `runtime = "runsc"` (gVisor) |
+|---|---|---|
+| The agent's system calls reach | the host kernel, through the seccomp profile | the Sentry, through the same profile |
+| The host kernel is reached by | the agent's processes | the Sentry and its file proxy, through gVisor's own seccomp filters |
+| The agent's sockets are implemented by | the host kernel's network stack | gVisor's network stack, in user space; the host kernel only sees the packets it builds |
+| An escape needs | one host kernel bug reachable through the profile | a Sentry bug, then a host kernel bug reachable from the Sentry's filtered system calls |
+
+**Out of scope**: kernel vulnerabilities reachable through the allowed system calls under runc
+(the agent shares the host kernel) and gVisor vulnerabilities under runsc; the gateway shares the
+host kernel under both. Also out of scope: a compromised Docker daemon, and what the user does
+with the code afterwards.
 
 ## Limitations
 
@@ -457,8 +557,13 @@ Docker daemon, and what the user does with the code afterwards.
   gateway does not decode defeat canary matching, and so does a value padded with more
   whitespace or escapes than the scanner holds back at a chunk boundary (three times the
   longest encoded value). Canaries are tripwires, not a guarantee.
-- **Shared kernel.** seccomp reduces the attack surface but a kernel exploit escapes any
-  container. For stronger isolation, run the agent under gVisor or Kata Containers.
+- **Shared kernel (runc).** seccomp reduces the attack surface but a kernel exploit escapes any
+  container. For stronger isolation, set `runtime = "runsc"` (gVisor); Kata Containers and other
+  VM-based runtimes are not supported.
+- **gVisor**: slower system calls and I/O, and not every system call is implemented (see
+  [gVisor (optional)](#gvisor-optional)); it needs gVisor 20261012.0 or later registered with
+  `--oci-seccomp`, and it does not work on Docker Desktop. The tripwire still sees the agent
+  open a canary file, because gVisor opens the host file on the agent's behalf.
 - **The workspace is writable.** The agent can change any file in your project, including build
   scripts, `package.json` scripts, `Makefile`, `.vscode/tasks.json` or `.envrc`, which run on the
   host when you use them. Review the diff before running anything the agent touched.
@@ -479,14 +584,28 @@ python -m agent_sandbox.seccomp --check   # profile matches the generator
 agent-sandbox -w /tmp/demo verify --build # end-to-end on a real Docker daemon
 ```
 
+[`scripts/e2e-dind.sh`](scripts/e2e-dind.sh) runs `verify --build` under runsc and runc, with
+and without TLS inspection, inside a privileged `docker:dind` container: it installs a pinned
+gVisor release (SHA-512 checked) into that container's own Docker daemon, so the host daemon is
+left alone. The CLI runs in the same container, where the bind mounts resolve:
+
+```bash
+docker run -d --privileged --name agent-sandbox-e2e -e DOCKER_TLS_CERTDIR= docker:29.8.1-dind
+git archive HEAD | docker exec -i agent-sandbox-e2e sh -c 'mkdir /src && tar -xf - -C /src'
+docker exec agent-sandbox-e2e sh /src/scripts/e2e-dind.sh /src   # GVISOR_PLATFORM=ptrace on Docker Desktop
+docker rm -f -v agent-sandbox-e2e
+```
+
 CI: [`.gitlab-ci.yml`](.gitlab-ci.yml) runs lint, unit tests on Python 3.11-3.13 and validates the
-generated Compose file. The end-to-end test needs bind mounts on the Docker host, so it runs in
+generated Compose file; the manual `gvisor-end-to-end` job runs the script above (it needs a
+privileged runner). The end-to-end test also runs in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (for a future GitHub mirror) and locally.
 
 ```text
 src/agent_sandbox/
   cli.py              agent-sandbox ...
   config.py           .agent-sandbox.toml, state paths
+  runtime.py          docker info check for the configured runtime (runc or runsc)
   compose.py          Compose spec (hardening, networks, mounts)
   canary.py           canary generation and encoded-value matching
   allowlist.py        host:port allowlist with method and path rules
@@ -498,6 +617,7 @@ src/agent_sandbox/
   docker/             agent.Dockerfile, gateway.Dockerfile (base images pinned by digest)
 tests/                unit tests for every module
 examples/             configuration for running Claude Code in the sandbox
+scripts/e2e-dind.sh   end-to-end self-test under gVisor and runc in Docker-in-Docker
 ```
 
 ## License
