@@ -1,0 +1,34 @@
+# agent-sandbox configuration for the defense-in-depth demo.
+#
+# This file is safe to commit: it contains no secrets. The demo driver copies this
+# workspace to a throwaway directory, generates the Compose project from it, builds
+# demo-tagged images and runs everything with the Docker label agent-task=demo.
+
+[sandbox]
+name = "defense-in-depth-demo"
+# A demo-specific image built on top of the base agent image, with toolguard and
+# the MCP scanner installed from wheels. The demo driver builds it before `up`.
+agent_image = "agent-sandbox-demo/agent:defense-in-depth"
+
+[network]
+# The attacker's collector host is deliberately absent from the allowlist (and uses
+# the non-routable .invalid TLD), so the gateway refuses any connection to it.
+# pypi.org is on the default allowlist and is inspected, so the demo can show that
+# exfiltration to an *allowlisted* host is still caught by canary scanning.
+allow = []
+extend_default_allow = true
+# Decrypt HTTPS so a canary in a request body to an allowlisted host is detected.
+tls_inspect = true
+# A private subnet chosen not to collide with the default sandbox (172.31.250.0/24).
+subnet = "172.31.236.0/24"
+
+[resources]
+cpus = 2
+memory = "2g"
+pids = 256
+
+[env]
+pass = []
+
+[canaries]
+kinds = ["aws", "ssh", "github", "dotenv", "netrc", "git", "url"]

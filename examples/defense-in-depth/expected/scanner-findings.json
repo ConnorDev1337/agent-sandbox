@@ -1,0 +1,16 @@
+{
+  "description": "Rule IDs the mcp-security-scanner must report for the demo workspace (.mcp.json + mcp-tools.json). Checked by tests/test_defense_in_depth.py when the scanner is importable.",
+  "by_severity": {"critical": 1, "high": 7, "medium": 2},
+  "rules": [
+    "MCPS101",
+    "MCPS102",
+    "MCPS103",
+    "MCPS104",
+    "MCPS105",
+    "MCPS120",
+    "MCPS204",
+    "MCPS206",
+    "MCPS213",
+    "MCPS214"
+  ]
+}

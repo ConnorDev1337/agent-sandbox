@@ -1,0 +1,16 @@
+# Out-of-band approval configuration for the demo (see tool-call-guard).
+#
+# A single "file" notifier writes the one-time approval code to a log the operator
+# watches. In a real deployment this file must live where the agent cannot read it
+# (another OS user, or outside the container); here it is inside the sandbox purely
+# so the demo can show the notice it produces. No secrets live in this file: codes
+# are generated at run time and only ever written to the notifier target.
+
+[challenge]
+code_ttl = 300
+max_attempts = 5
+length = 12
+
+[[notifier]]
+type = "file"
+path = "/home/agent/.toolguard/approvals-notifier.log"
