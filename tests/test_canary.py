@@ -87,6 +87,58 @@ def test_detects_encoded_secrets(canaries, matcher, encode):
     assert hit.kind == "aws"
 
 
+def _wrap(text: str, width: int, sep: str = "\r\n") -> str:
+    return sep.join(text[i : i + width] for i in range(0, len(text), width))
+
+
+@pytest.mark.parametrize(
+    ("encode", "label"),
+    [
+        # base64(1) and MIME wrap at 76 columns; prefixes move the line breaks around.
+        (lambda s, p: _wrap(base64.b64encode(p + s.encode()).decode(), 76, "\n"), "base64"),
+        (lambda s, p: _wrap(base64.b64encode(p + s.encode()).decode(), 76), "base64"),
+        (lambda s, p: " ".join(f"{b:02x}" for b in p + s.encode()), "hex"),
+        (lambda s, p: _wrap(p.decode() + s, 9, "=\r\n"), "plain"),  # quoted-printable
+        (lambda s, p: p.decode() + quote(s, safe="/"), "url|plain (percent-decoded)"),
+        (
+            lambda s, p: p.decode() + "".join(f"%{b:02X}" for b in s.encode()),
+            "plain (percent-decoded)",
+        ),
+        (
+            lambda s, p: p.decode() + "".join(f"%{b:02x}" for b in s.encode()[:20]) + s[20:],
+            "plain (percent-decoded)",
+        ),
+    ],
+    ids=[
+        "b64-lf",
+        "b64-crlf",
+        "hex-spaced",
+        "quoted-printable",
+        "url-keep-slash",
+        "url-all",
+        "url-mixed",
+    ],
+)
+def test_detects_wrapped_and_partially_encoded_secrets(canaries, matcher, encode, label):
+    secret = _secret(canaries, "aws", 1)
+    for prefix in (b"", b"k", b"key=", b"aws_secret_access_key = "):
+        (hit,) = matcher.scan(f"part\r\n\r\n{encode(secret, prefix)}\r\n--boundary--")
+        assert hit.kind == "aws" and hit.encoding in label.split("|")
+
+
+def test_multipart_upload_of_a_canary_file_is_detected(canaries, matcher):
+    aws = next(c for c in canaries if c.kind == "aws")
+    for transfer, body in (
+        ("binary", aws.content),
+        ("base64", _wrap(base64.b64encode(aws.content.encode()).decode(), 76)),
+    ):
+        payload = (
+            "--b\r\nContent-Disposition: form-data; name=file; filename=credentials\r\n"
+            f"Content-Transfer-Encoding: {transfer}\r\n\r\n{body}\r\n--b--\r\n"
+        )
+        assert matcher.scan(payload)[0].canary_id == aws.id
+
+
 def test_whole_file_exfiltration_is_detected(canaries, matcher):
     ssh = next(c for c in canaries if c.kind == "ssh")
     assert matcher.scan(ssh.content)[0].canary_id == ssh.id
@@ -138,6 +190,15 @@ def test_stream_scanner_holds_back_split_canaries(canaries, matcher):
     assert secret[:15] not in released and len(released) <= 1000
     released, hits = scanner.feed(secret[15:])
     assert released == b"" and hits[0].kind == "aws"
+
+
+def test_stream_scanner_finds_a_wrapped_canary_split_across_pieces(canaries, matcher):
+    secret = next(c for c in canaries if c.kind == "dotenv").secrets[1].encode()
+    wrapped = _wrap(base64.b64encode(b"x" + secret).decode(), 8, "\r\n").encode()
+    scanner = StreamScanner(matcher)
+    released, hits = scanner.feed(b"a" * 500 + wrapped[:30])
+    assert hits == [] and wrapped[:12] not in released
+    assert scanner.feed(wrapped[30:])[1][0].kind == "dotenv"
 
 
 def test_stream_scanner_releases_everything_eventually(matcher):

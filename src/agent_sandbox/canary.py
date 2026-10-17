@@ -4,24 +4,33 @@ Each canary is a realistic-looking but fake credential file. The values are
 unique per sandbox and only the gateway knows them, so any appearance in
 outbound traffic or DNS queries is evidence of an exfiltration attempt.
 Detection also covers common encodings (URL, hex, base64, base32), since an
-agent trying to smuggle data out will often encode it.
+agent trying to smuggle data out will often encode it, and the usual ways
+those get wrapped: line breaks and spaces (``base64`` output, MIME parts,
+hex dumps), quoted-printable soft line breaks and partial or excessive
+percent-encoding.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import re
 import secrets
 import string
 import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote_to_bytes
 
 KINDS = ("aws", "ssh", "github", "dotenv", "netrc", "git", "url")
 REGISTRY_VERSION = 1
 MIN_NEEDLE = 12  # shorter encoded fragments would cause false positives
+# Canary values never contain whitespace, so it is removed before searching:
+# a value wrapped over several lines is then found like an unwrapped one.
+_WHITESPACE = b" \t\r\n\x0b\x0c"
+_SOFT_BREAK = re.compile(rb"=\r?\n")  # quoted-printable soft line break
+SPAN = 3  # a match may span up to SPAN times its length (percent-encoding)
 
 _ALNUM = string.ascii_letters + string.digits
 _UPPER = string.ascii_uppercase + string.digits
@@ -213,22 +222,38 @@ class CanaryMatcher:
             for value in canary.secrets:
                 for name, needles in encodings(value).items():
                     for needle in needles:
-                        key = needle.encode()
-                        if key not in seen:
+                        key = needle.encode().translate(None, _WHITESPACE)
+                        if len(key) >= MIN_NEEDLE and key not in seen:
                             seen.add(key)
                             self._needles.append((key, canary, name))
             for host in canary.hosts:
                 self._hosts.append((host.lower(), canary))
                 self._needles.append((host.lower().encode(), canary, "hostname"))
         self.longest = max((len(needle) for needle, _, _ in self._needles), default=0)
+        # Bytes a match can span in the data before normalization.
+        self.span = SPAN * self.longest
+
+    @staticmethod
+    def _views(data: bytes) -> list[tuple[bytes, str]]:
+        """Return normalized forms of ``data`` to search, with a label for each."""
+        view = data.lower()
+        if b"=\n" in view or b"=\r\n" in view:
+            view = _SOFT_BREAK.sub(b"", view)
+        view = view.translate(None, _WHITESPACE)
+        views = [(view, "")]
+        if b"%" in view:
+            decoded = unquote_to_bytes(view).lower().translate(None, _WHITESPACE)
+            views.append((decoded, " (percent-decoded)"))
+        return views
 
     def scan(self, data: bytes | str) -> list[CanaryHit]:
         """Every canary whose value (in any known encoding) occurs in ``data``."""
-        haystack = (data.encode("utf-8", "replace") if isinstance(data, str) else data).lower()
+        raw = data.encode("utf-8", "replace") if isinstance(data, str) else data
         hits: dict[str, CanaryHit] = {}
-        for needle, canary, encoding in self._needles:
-            if canary.id not in hits and needle in haystack:
-                hits[canary.id] = CanaryHit(canary.id, canary.kind, encoding)
+        for haystack, label in self._views(raw):
+            for needle, canary, encoding in self._needles:
+                if canary.id not in hits and needle in haystack:
+                    hits[canary.id] = CanaryHit(canary.id, canary.kind, encoding + label)
         return list(hits.values())
 
     def scan_hostname(self, name: str) -> list[CanaryHit]:
@@ -247,14 +272,14 @@ class CanaryMatcher:
 class StreamScanner:
     """Scan a byte stream piece by piece and release only data proven canary-free.
 
-    The last ``longest - 1`` bytes are held back until more data (or the end of
+    The last ``span - 1`` bytes are held back until more data (or the end of
     the stream) arrives, so a canary split across pieces is caught before any
     part of it is released.
     """
 
     def __init__(self, matcher: CanaryMatcher) -> None:
         self._matcher = matcher
-        self._hold = max(matcher.longest - 1, 0)
+        self._hold = max(matcher.span - 1, 0)
         self._tail = b""
 
     def feed(self, data: bytes) -> tuple[bytes, list[CanaryHit]]:
