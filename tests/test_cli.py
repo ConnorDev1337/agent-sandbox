@@ -109,6 +109,66 @@ def test_verify_reports_checks_and_expected_alerts(capsys, workspace, docker, mo
     assert run(capsys, workspace, "verify", "--no-up")[0] == 2
 
 
+def test_verify_with_tls_inspection_and_method_rules(capsys, workspace, docker, monkeypatch):
+    (workspace / ".agent-sandbox.toml").write_text(
+        '[network]\ntls_inspect = true\nallow = [{ host = "github.com", methods = ["GET"] }]\n',
+        encoding="utf-8",
+    )
+    config = load(workspace)
+    config.log_dir.mkdir(parents=True)
+    docker.stdout = "\n".join(
+        [
+            json.dumps({"check": "a", "ok": True, "detail": "ok"}),
+            json.dumps({"check": "b", "ok": True, "detail": "off", "skipped": True}),
+        ]
+    )
+    alerts = [
+        {"ts": "9999-01-01T00:00:00Z", "kind": kind, "severity": "critical"}
+        for kind in cli.EXPECTED_ALERTS
+    ]
+    (config.log_dir / "alerts.jsonl").write_text(
+        "\n".join(json.dumps(a) for a in alerts) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    code, out, _ = run(capsys, workspace, "verify", "--no-up")
+    selftest_call = docker.calls[-1]
+    assert "--tls-inspect" in selftest_call
+    assert selftest_call[-4:] == [
+        "--restricted-host",
+        "github.com",
+        "--forbidden-method",
+        "DELETE",
+    ]
+    assert (
+        code == 1 and "FAIL  gateway raised a canary.exfiltration alert for decrypted TLS" in out
+    )
+    assert "SKIP  b" in out and "4/5 checks passed, 1 skipped" in out
+    alerts.append({"ts": "9999-01-01T00:00:00Z", "kind": "canary.exfiltration", "tls": True})
+    (config.log_dir / "alerts.jsonl").write_text(
+        "\n".join(json.dumps(a) for a in alerts) + "\n", encoding="utf-8"
+    )
+    code, out, _ = run(capsys, workspace, "verify", "--no-up")
+    assert code == 0 and "5/5 checks passed, 1 skipped" in out
+
+
+@pytest.mark.parametrize(
+    ("allow", "tls", "expected"),
+    [
+        ("[]", False, None),
+        ('[{ host = "github.com", methods = ["GET", "POST"] }]', True, ("github.com", "DELETE")),
+        ('[{ host = "*.example.com", methods = ["GET"] }]', True, None),
+        ('[{ host = "a.example:8443", methods = ["GET"] }]', True, None),
+        ('[{ host = "a.example", methods = ["DELETE", "PUT", "PATCH", "POST"] }]', False, None),
+        ('[{ host = "a.example", paths = ["/api/*"] }]', False, ("a.example", "DELETE")),
+    ],
+)
+def test_restricted_target(workspace, allow, tls, expected):
+    (workspace / ".agent-sandbox.toml").write_text(
+        f"[network]\ntls_inspect = {str(tls).lower()}\nallow = {allow}\n", encoding="utf-8"
+    )
+    assert cli._restricted_target(load(workspace)) == expected
+
+
 def test_errors(capsys, workspace, docker, monkeypatch):
     docker.returncode = 1
     code, _, err = run(capsys, workspace, "up")

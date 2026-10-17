@@ -2,6 +2,8 @@
 
 Standalone (standard library only) because it is copied into the agent image.
 Each check prints one JSON line; the exit code is non-zero if any check fails.
+A check that does not apply to the configuration (for example TLS inspection
+checks when inspection is off) is reported as skipped.
 """
 
 from __future__ import annotations
@@ -10,13 +12,16 @@ import argparse
 import ctypes
 import ctypes.util
 import errno
+import http.client
 import json
 import os
 import platform
 import re
 import socket
+import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -40,7 +45,8 @@ SYSCALLS = {
 CLONE_NEWUSER = 0x10000000
 AF_PACKET, SOCK_RAW = 17, 3
 
-Check = Callable[[argparse.Namespace], tuple[bool, str]]
+# ``ok`` is None when the check does not apply to this sandbox's configuration.
+Check = Callable[[argparse.Namespace], tuple[bool | None, str]]
 CHECKS: list[tuple[str, Check]] = []
 
 
@@ -147,8 +153,10 @@ def _dns(_args):
     return False, f"resolved to {addresses[0][4][0]}"
 
 
-def _fetch(url: str, data: bytes | None = None) -> tuple[int | None, str]:
-    request = urllib.request.Request(url, data=data)  # noqa: S310 - fixed test URLs
+def _fetch(
+    url: str, data: bytes | None = None, method: str | None = None
+) -> tuple[int | None, str]:
+    request = urllib.request.Request(url, data=data, method=method)  # noqa: S310 - test URLs
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
             return response.status, ""
@@ -202,11 +210,81 @@ def _dns_exfiltration(_args):
     return False, "query resolved"
 
 
+def _peer_issuer(host: str) -> str:
+    """Return the organization that issued the certificate seen for ``host`` via the proxy."""
+    proxy = urllib.parse.urlsplit(os.environ.get("HTTPS_PROXY", ""))
+    if not proxy.hostname:
+        raise RuntimeError("HTTPS_PROXY is not set")
+    connection = http.client.HTTPSConnection(
+        proxy.hostname, proxy.port or 3128, timeout=TIMEOUT, context=ssl.create_default_context()
+    )
+    connection.set_tunnel(host, 443)
+    try:
+        connection.connect()
+        certificate = connection.sock.getpeercert()  # type: ignore[union-attr]
+    finally:
+        connection.close()
+    issuer = dict(item[0] for item in certificate.get("issuer", ()))
+    return str(issuer.get("organizationName") or issuer.get("commonName") or "?")
+
+
+@check("HTTPS is re-signed by the sandbox CA (TLS inspection)")
+def _tls_intercepted(args):
+    if not args.tls_inspect:
+        return None, "TLS inspection is off"
+    issuer = _peer_issuer(args.allowed_host)
+    return issuer == "agent-sandbox", f"{args.allowed_host} certificate issued by {issuer}"
+
+
+@check("CA bundle is read-only and holds no private key")
+def _ca_bundle(args):
+    if not args.tls_inspect:
+        return None, "TLS inspection is off"
+    bundle = Path(os.environ.get("SSL_CERT_FILE", "/nonexistent"))
+    if not bundle.is_file():
+        return False, f"SSL_CERT_FILE={bundle} is missing"
+    leaked = [p.name for p in bundle.parent.iterdir() if b"PRIVATE KEY" in p.read_bytes()]
+    try:
+        (bundle.parent / ".agent-sandbox-write-test").write_text("x", encoding="ascii")
+    except OSError as exc:
+        writable, reason = False, os.strerror(exc.errno or 0)
+    else:
+        writable, reason = True, "writable"
+    ok = not leaked and not writable
+    return ok, f"{bundle} {reason}" + (f", private key in {leaked}" if leaked else "")
+
+
+@check("canary in an HTTPS request body is blocked")
+def _https_exfiltration(args):
+    if not args.tls_inspect:
+        return None, "TLS inspection is off: HTTPS bodies are not visible to the gateway"
+    secret = _canary_secret()
+    if secret is None:
+        return False, "no canary found in ~/.aws/credentials"
+    status, detail = _fetch(f"https://{args.allowed_host}/upload", data=f"k={secret}".encode())
+    return status == 403 and "canary" in detail, f"status={status} {detail[:80]}".strip()
+
+
+@check("forbidden HTTP method is refused")
+def _forbidden_method(args):
+    if not args.restricted_host:
+        return None, "no method rules in network.allow"
+    scheme = "https" if args.tls_inspect else "http"
+    url = f"{scheme}://{args.restricted_host}/"
+    status, detail = _fetch(url, data=b"" if args.forbidden_method != "GET" else None,
+                            method=args.forbidden_method)  # fmt: skip
+    ok = status == 403 and "agent-sandbox gateway" in detail
+    return ok, f"{args.forbidden_method} {url} status={status} {detail[:70]}".strip()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="selftest")
     parser.add_argument("--allowed-host", default="pypi.org")
     parser.add_argument("--denied-host", default="example.com")
     parser.add_argument("--host-ip", default="172.31.250.1")
+    parser.add_argument("--tls-inspect", action="store_true")
+    parser.add_argument("--restricted-host", default=None)
+    parser.add_argument("--forbidden-method", default="DELETE")
     args = parser.parse_args(argv)
     failed = 0
     for name, func in CHECKS:
@@ -214,8 +292,11 @@ def main(argv: list[str] | None = None) -> int:
             ok, detail = func(args)
         except Exception as exc:  # A crashing check is a failed check.
             ok, detail = False, f"{type(exc).__name__}: {exc}"
-        failed += not ok
-        print(json.dumps({"check": name, "ok": ok, "detail": detail}), flush=True)
+        row = {"check": name, "ok": ok is not False, "detail": detail}
+        if ok is None:
+            row["skipped"] = True
+        failed += ok is False
+        print(json.dumps(row), flush=True)
     return 1 if failed else 0
 
 

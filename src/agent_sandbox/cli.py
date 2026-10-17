@@ -20,6 +20,8 @@ from .canary import generate, load_registry, save_registry
 from .config import CONFIG_FILE, ConfigError, SandboxConfig, load
 
 EXPECTED_ALERTS = ("canary.exfiltration", "canary.dns", "canary.file_access")
+# Methods the self-test tries against a host with method rules, in order.
+FORBIDDEN_CANDIDATES = ("DELETE", "PUT", "PATCH", "POST")
 SAMPLE_CONFIG = """\
 # agent-sandbox configuration (safe to commit: it contains no secrets).
 
@@ -200,6 +202,19 @@ def _allowed_host(config: SandboxConfig) -> str:
     return "pypi.org"
 
 
+def _restricted_target(config: SandboxConfig) -> tuple[str, str] | None:
+    """Return a host with method rules and a method they refuse, for the self-test."""
+    allowlist = Allowlist(config.allow, config.default_ports)
+    port = 443 if config.tls_inspect else 80
+    for rule in allowlist.rules:
+        if not rule.restricted or rule.host.startswith("*.") or port not in rule.ports:
+            continue
+        for method in FORBIDDEN_CANDIDATES:
+            if not allowlist.permits(rule.host, port, method, "/"):
+                return rule.host, method
+    return None
+
+
 def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
     started = _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
     if not args.no_up:
@@ -212,6 +227,11 @@ def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
         "--host-ip",
         config.bridge_ip,
     ]
+    if config.tls_inspect:
+        command.append("--tls-inspect")
+    target = _restricted_target(config)
+    if target is not None:
+        command += ["--restricted-host", target[0], "--forbidden-method", target[1]]
     result = run(
         compose_command(config, "exec", "-T", "agent", *command), capture=True, check=False
     )
@@ -229,20 +249,24 @@ def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
         a for a in _read_jsonl(config.log_dir / "alerts.jsonl") if a.get("ts", "") >= started
     ]
     seen = {a.get("kind") for a in alerts}
-    for kind in EXPECTED_ALERTS:
-        rows.append(
-            {
-                "check": f"gateway raised a {kind} alert",
-                "ok": kind in seen,
-                "detail": "found" if kind in seen else "missing",
-            }
+    expected = {f"gateway raised a {kind} alert": kind in seen for kind in EXPECTED_ALERTS}
+    if config.tls_inspect:
+        expected["gateway raised a canary.exfiltration alert for decrypted TLS"] = any(
+            a.get("kind") == "canary.exfiltration" and a.get("tls") is True for a in alerts
         )
+    for name, found in expected.items():
+        rows.append({"check": name, "ok": found, "detail": "found" if found else "missing"})
     width = max(len(r["check"]) for r in rows)
     for row in rows:
-        mark = "PASS" if row["ok"] else "FAIL"
+        mark = "SKIP" if row.get("skipped") else "PASS" if row["ok"] else "FAIL"
         print(f"{mark}  {row['check']:<{width}}  {row['detail']}")
-    failed = sum(1 for r in rows if not r["ok"])
-    print(f"\n{len(rows) - failed}/{len(rows)} checks passed")
+    ran = [r for r in rows if not r.get("skipped")]
+    failed = sum(1 for r in ran if not r["ok"])
+    skipped = len(rows) - len(ran)
+    print(
+        f"\n{len(ran) - failed}/{len(ran)} checks passed"
+        + (f", {skipped} skipped (not enabled in this configuration)" if skipped else "")
+    )
     return 1 if failed else 0
 
 
