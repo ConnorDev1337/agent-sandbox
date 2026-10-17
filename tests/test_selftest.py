@@ -1,4 +1,5 @@
 import json
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -154,3 +155,40 @@ def test_skipped_checks_do_not_fail(monkeypatch, capsys):
 def test_every_syscall_has_both_architectures():
     assert all(len(numbers) == 2 for numbers in selftest.SYSCALLS.values())
     assert len(selftest.CHECKS) >= 12
+
+
+def test_gzip_exfiltration_check(tmp_path, monkeypatch, server):
+    monkeypatch.setattr(selftest.Path, "home", lambda: tmp_path)
+    assert selftest._gzip_exfiltration(_args(allowed_host=server))[0] is False  # no canary
+    (tmp_path / ".aws").mkdir()
+    (tmp_path / ".aws" / "credentials").write_text(
+        "aws_secret_access_key = abc123SECRET\n", encoding="utf-8"
+    )
+    ok, detail = selftest._gzip_exfiltration(_args(allowed_host=server))
+    assert ok and detail.startswith("http status=403")
+    ok, detail = selftest._gzip_exfiltration(_args(allowed_host="127.0.0.1:9"))
+    assert not ok and "status=None" in detail
+
+
+def test_node_checks(monkeypatch):
+    monkeypatch.setattr(selftest.shutil, "which", lambda name: None)
+    assert selftest._node_allowed(_args())[0] is None
+    assert selftest._node_denied(_args(denied_host="example.com"))[0] is None
+
+    outputs = {
+        "https://pypi.org/": '{"version": "v22.23.3", "status": 200}\n',
+        "https://example.com/": '{"version": "v22.23.3", "error": "Error: Proxy response'
+        ' (403) !== 200 when HTTP Tunneling"}\n',
+    }
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, outputs.get(argv[3], ""), "boom")
+
+    monkeypatch.setattr(selftest.shutil, "which", lambda name: "/usr/local/bin/node")
+    monkeypatch.setattr(selftest.subprocess, "run", fake_run)
+    ok, detail = selftest._node_allowed(_args())
+    assert ok and "v22.23.3 status=200" in detail
+    ok, detail = selftest._node_denied(_args(denied_host="example.com"))
+    assert ok and "403" in detail
+    assert selftest._node_fetch("https://other.example/") == {"error": "boom"}
+    assert selftest._node_allowed(_args(allowed_host="other.example"))[0] is False
