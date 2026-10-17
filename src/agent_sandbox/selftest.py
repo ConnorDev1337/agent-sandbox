@@ -303,12 +303,17 @@ def _gzip_exfiltration(args):
     return ok, f"{scheme} status={status} {detail[:70]}".strip()
 
 
-# Node.js built-in fetch, with the outcome printed as one JSON line.
+# Node.js built-in fetch, with the outcome (and the chain of error causes,
+# where undici reports the proxy's answer) printed as one JSON line.
 NODE_FETCH = """
+const causes = e => {
+  const parts = [];
+  for (let c = e; c && parts.length < 5; c = c.cause) parts.push(String(c.message || c));
+  return parts.join(": ");
+};
 fetch(process.argv[1], {signal: AbortSignal.timeout(Number(process.argv[2]))})
   .then(r => console.log(JSON.stringify({version: process.version, status: r.status})))
-  .catch(e => console.log(JSON.stringify({version: process.version,
-                                          error: String((e && e.cause) || e)})));
+  .catch(e => console.log(JSON.stringify({version: process.version, error: causes(e)})));
 """
 
 
@@ -347,7 +352,7 @@ def _node_denied(args):
         return None, "node is not installed in the agent image"
     error = str(outcome.get("error", ""))
     ok = "status" not in outcome and "403" in error
-    return ok, f"node {outcome.get('version', '?')} {error[:100]}".strip()
+    return ok, f"node {outcome.get('version', '?')} {error[:120]}".strip()
 
 
 def main(argv: list[str] | None = None) -> int:
