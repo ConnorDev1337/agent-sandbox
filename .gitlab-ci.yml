@@ -1,9 +1,10 @@
 # Lint, unit tests and Compose validation. The end-to-end isolation test needs
-# bind mounts on the Docker host, which Docker-in-Docker on shared runners does
-# not provide; it runs in .github/workflows/ci.yml and locally via
+# bind mounts on the Docker host, which a docker:dind *service* does not
+# provide; the manual gvisor-end-to-end job runs the CLI next to its own Docker
+# daemon instead. The test also runs in .github/workflows/ci.yml and locally via
 # `agent-sandbox verify`.
 
-stages: [lint, test]
+stages: [lint, test, end-to-end]
 
 default:
   image: python:3.13-slim
@@ -70,3 +71,23 @@ compose-config:
       docker compose
       -f "$(agent-sandbox -w /tmp/workspace config | python3 -c 'import json,sys;
       print(json.load(sys.stdin)["state_dir"])')/compose.json" config --quiet
+
+gvisor-end-to-end:
+  # Self-test under gVisor (runsc, systrap platform) and, as a control, runc:
+  # scripts/e2e-dind.sh starts a Docker daemon inside this job's container,
+  # installs a pinned gVisor release into it and runs `agent-sandbox verify`
+  # there. Needs a runner with privileged mode (GitLab.com's hosted Linux
+  # runners have it). Manual: it builds both images and downloads gVisor.
+  stage: end-to-end
+  image:
+    name: docker:29.8.1-dind@sha256:3f3c01aaaebf7cce837356b688b7c059a4749f10bd7660dec7c58fc454a283f0
+    entrypoint: [""]
+  needs: []
+  timeout: 45m
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    - sh scripts/e2e-dind.sh "$CI_PROJECT_DIR"
