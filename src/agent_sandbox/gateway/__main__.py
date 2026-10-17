@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import tempfile
 from pathlib import Path
 
 from ..allowlist import Allowlist
 from ..canary import CanaryMatcher, load_registry
-from . import dns, proxy
+from . import certs, dns, proxy
 from .alerts import EventLog
 from .tripwire import Tripwire, seed
 
@@ -20,6 +21,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--canaries", type=Path, default=Path("/etc/agent-sandbox/canaries.json"))
     parser.add_argument("--home", type=Path, default=Path("/sandbox-home"))
     parser.add_argument("--log-dir", type=Path, default=Path("/var/log/agent-sandbox"))
+    # TLS inspection: the CA key lives in a gateway-only volume, the published
+    # certificates in a volume the agent mounts read-only.
+    parser.add_argument("--ca-dir", type=Path, default=Path("/var/lib/agent-sandbox/ca"))
+    parser.add_argument("--tls-dir", type=Path, default=Path("/sandbox-tls"))
     parser.add_argument("--listen", default="0.0.0.0")  # noqa: S104 - internal network only
     parser.add_argument("--proxy-port", type=int, default=3128)
     parser.add_argument("--dns-port", type=int, default=53)
@@ -39,9 +44,23 @@ async def _run(args: argparse.Namespace) -> None:
         tripwire.arm()  # Watches exist before the proxy accepts connections
         tripwire.start()
 
+    issuer = None
+    if config.get("tls_inspect"):
+        # Ready before the proxy listens, so the agent never starts without its bundle.
+        workdir = Path(tempfile.mkdtemp(prefix="agent-sandbox-tls-"))
+        issuer = certs.prepare(args.ca_dir, args.tls_dir, workdir)
+        log.event("tls.inspection_enabled", ca_fingerprint=issuer.ca.fingerprint())
+
     allowlist = Allowlist(config.get("allow", []), config.get("default_ports", (80, 443)))
     server = await proxy.serve(
-        proxy.Proxy(allowlist, matcher, log, max_body=config.get("max_body", 10 * 1024 * 1024)),
+        proxy.Proxy(
+            allowlist,
+            matcher,
+            log,
+            max_body=config.get("max_body", 10 * 1024 * 1024),
+            tls_issuer=issuer,
+            upstream_tls=certs.upstream_context() if issuer else None,
+        ),
         args.listen,
         args.proxy_port,
     )
@@ -50,6 +69,7 @@ async def _run(args: argparse.Namespace) -> None:
         "gateway.started",
         allow=len(allowlist.rules),
         canaries=len(canaries),
+        tls_inspect=issuer is not None,
         proxy_port=args.proxy_port,
         dns_port=args.dns_port,
     )

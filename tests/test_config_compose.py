@@ -193,3 +193,33 @@ def test_seccomp_rejects_unexpected_upstream(tmp_path):
     fake.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
         load_upstream(fake)
+
+
+def test_compose_without_tls_inspection_has_no_ca(workspace):
+    spec = compose.build(load(workspace))
+    agent = spec["services"]["agent"]
+    assert set(spec["volumes"]) == {"home"}
+    assert not {"SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} & set(agent["environment"])
+
+
+def test_compose_with_tls_inspection_keeps_the_ca_key_in_the_gateway(workspace):
+    write_config(workspace, "[network]\ntls_inspect = true\n")
+    spec = compose.build(load(workspace))
+    agent, gateway = spec["services"]["agent"], spec["services"]["gateway"]
+    assert set(spec["volumes"]) == {"home", "ca", "tls"}
+    gateway_mounts = {m["target"]: m["source"] for m in gateway["volumes"]}
+    assert gateway_mounts[compose.GATEWAY_CA_DIR] == "ca"
+    assert gateway_mounts[compose.GATEWAY_TLS_DIR] == "tls"
+    agent_mounts = {m["target"]: m for m in agent["volumes"]}
+    assert agent_mounts[compose.AGENT_TLS_DIR] == {
+        "type": "volume",
+        "source": "tls",
+        "target": compose.AGENT_TLS_DIR,
+        "read_only": True,
+    }
+    assert all(m.get("source") != "ca" for m in agent["volumes"])
+    assert agent["read_only"] is True
+    env = agent["environment"]
+    bundle = f"{compose.AGENT_TLS_DIR}/ca-bundle.crt"
+    assert all(env[name] == bundle for name in compose.CA_BUNDLE_VARIABLES)
+    assert env["NODE_EXTRA_CA_CERTS"] == f"{compose.AGENT_TLS_DIR}/ca.crt"
