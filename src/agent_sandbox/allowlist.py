@@ -10,6 +10,12 @@ limits the HTTP methods and request paths::
 Rules with ``methods`` or ``paths`` only ever narrow access: once such a rule
 matches a destination, a request to it must be permitted by at least one of
 the restricting rules, regardless of plain entries for the same host.
+
+With TLS inspection, ``{host = "...", inspect = false}`` relays HTTPS to the
+matching destinations as opaque TLS after the allowlist and SNI checks, for
+clients that pin certificates or use their own root store. Requests inside
+such tunnels are invisible, so a passthrough rule cannot overlap a rule with
+``methods`` or ``paths``.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from fnmatch import fnmatchcase
 from typing import Any
 
 DEFAULT_PORTS = (80, 443)
-RULE_KEYS = frozenset({"host", "methods", "paths"})
+RULE_KEYS = frozenset({"host", "methods", "paths", "inspect"})
 _LABEL = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$")
 _METHOD = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
 # Paths that servers may normalize differently from a plain glob match.
@@ -54,10 +60,16 @@ class AllowRule:
     ports: tuple[int, ...]
     methods: frozenset[str] | None = None  # None: any method
     paths: tuple[str, ...] | None = None  # None: any path
+    inspect: bool = True  # False: HTTPS is relayed as opaque TLS under inspection
 
     @property
     def restricted(self) -> bool:
         return self.methods is not None or self.paths is not None
+
+    @property
+    def target(self) -> str:
+        """The host pattern, with the port when the rule is limited to one."""
+        return self.host if len(self.ports) > 1 else f"{self.host}:{self.ports[0]}"
 
     def matches(self, host: str, port: int) -> bool:
         if port not in self.ports:
@@ -65,6 +77,19 @@ class AllowRule:
         if self.host.startswith("*."):
             return host.endswith(self.host[1:])
         return host == self.host
+
+    def overlaps(self, other: AllowRule) -> bool:
+        """Return True if some ``host:port`` is matched by both rules."""
+        if not set(self.ports) & set(other.ports):
+            return False
+        mine, theirs = self.host, other.host
+        if mine.startswith("*.") and theirs.startswith("*."):
+            return mine[1:].endswith(theirs[1:]) or theirs[1:].endswith(mine[1:])
+        if mine.startswith("*."):
+            return theirs.endswith(mine[1:])
+        if theirs.startswith("*."):
+            return mine.endswith(theirs[1:])
+        return mine == theirs
 
     def permits(self, method: str, path: str) -> bool:
         """Return True if this rule lets ``method`` reach ``path`` (without query)."""
@@ -77,7 +102,9 @@ class AllowRule:
         return any(fnmatchcase(path, pattern) for pattern in self.paths)
 
     def describe(self) -> str:
-        text = self.host if len(self.ports) > 1 else f"{self.host}:{self.ports[0]}"
+        text = self.target
+        if not self.inspect:
+            text += " (TLS passthrough)"
         if self.methods is not None:
             text += f" [{','.join(sorted(self.methods))}]"
         if self.paths is not None:
@@ -107,7 +134,7 @@ def _string_list(value: Any, name: str, host: str) -> list[str]:
 
 
 def parse_rule(entry: AllowEntry, default_ports: Iterable[int] = DEFAULT_PORTS) -> AllowRule:
-    """Parse a string entry or a ``{host, methods, paths}`` table."""
+    """Parse a string entry or a ``{host, methods, paths, inspect}`` table."""
     ports = tuple(default_ports)
     if isinstance(entry, str):
         host, ports = _parse_host(entry, ports)
@@ -135,7 +162,28 @@ def parse_rule(entry: AllowEntry, default_ports: Iterable[int] = DEFAULT_PORTS) 
         bad = [p for p in paths if not p.startswith("/") or len(p) > 1024 or p != p.strip()]
         if bad:
             raise ValueError(f"paths for {raw_host!r} must start with '/': {', '.join(bad)}")
-    return AllowRule(host, ports, methods, paths)
+    inspect = entry.get("inspect", True)
+    if not isinstance(inspect, bool):
+        raise ValueError(f"inspect of allowlist entry {raw_host!r} must be true or false")
+    if not inspect and (methods is not None or paths is not None):
+        raise ValueError(
+            f"allowlist entry {raw_host!r} cannot combine inspect = false with methods or "
+            "paths: requests inside a TLS passthrough tunnel are not visible to the gateway"
+        )
+    return AllowRule(host, ports, methods, paths, inspect)
+
+
+def check_passthrough(rules: Iterable[AllowRule]) -> None:
+    """Refuse TLS passthrough rules that would silently disable method or path rules."""
+    rules = tuple(rules)
+    for passthrough in (rule for rule in rules if not rule.inspect):
+        for restricting in (rule for rule in rules if rule.restricted):
+            if passthrough.overlaps(restricting):
+                raise ValueError(
+                    f"{passthrough.target} is relayed without TLS inspection (inspect = false), "
+                    f"so the method/path rule for {restricting.describe()} could not be "
+                    "enforced on HTTPS; narrow one of the two entries so they do not overlap"
+                )
 
 
 class Allowlist:
@@ -144,6 +192,7 @@ class Allowlist:
     ):
         ports = tuple(default_ports)
         self.rules = tuple(parse_rule(entry, ports) for entry in entries)
+        check_passthrough(self.rules)
 
     def _matching(self, host: str, port: int) -> list[AllowRule]:
         normalized = normalize_host(host)
@@ -153,6 +202,10 @@ class Allowlist:
 
     def allows(self, host: str, port: int) -> bool:
         return bool(self._matching(host, port))
+
+    def passthrough(self, host: str, port: int) -> bool:
+        """Return True if TLS to ``host:port`` is relayed without inspection."""
+        return any(not rule.inspect for rule in self._matching(host, port))
 
     def restricted(self, host: str, port: int) -> bool:
         """Return True if requests to ``host:port`` are limited by method or path rules."""

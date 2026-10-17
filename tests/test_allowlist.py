@@ -103,9 +103,67 @@ def test_rule_description():
         ({"host": "x.example", "methods": ["CONNECT"]}, "invalid HTTP method"),
         ({"host": "x.example", "paths": ["v1/*"]}, "must start with '/'"),
         ({"host": "bad host", "methods": ["GET"]}, "invalid host"),
+        ({"host": "x.example", "inspect": "no"}, "true or false"),
+        ({"host": "x.example", "inspect": False, "methods": ["GET"]}, "cannot combine"),
+        ({"host": "x.example", "inspect": False, "paths": ["/v1/*"]}, "cannot combine"),
         (42, "string or a table"),
     ],
 )
 def test_invalid_tables(entry, message):
     with pytest.raises(ValueError, match=message):
         parse_rule(entry)
+
+
+def test_tls_passthrough_rules():
+    allow = Allowlist(
+        [
+            "pypi.org",
+            {"host": "pypi.org", "inspect": True},
+            {"host": "repo.maven.example", "inspect": False},
+            {"host": "*.crates.example", "inspect": False},
+            {"host": "registry.example:8443", "inspect": False},
+        ]
+    )
+    assert not allow.passthrough("pypi.org", 443)
+    assert allow.passthrough("REPO.maven.example.", 443)
+    assert allow.allows("repo.maven.example", 443)
+    assert allow.passthrough("static.crates.example", 443)
+    assert not allow.passthrough("crates.example", 443)  # wildcard means subdomains only
+    assert allow.passthrough("registry.example", 8443)
+    assert not allow.passthrough("registry.example", 443)
+    assert not allow.passthrough("other.example", 443)
+    assert [r.describe() for r in allow.rules[2:]] == [
+        "repo.maven.example (TLS passthrough)",
+        "*.crates.example (TLS passthrough)",
+        "registry.example:8443 (TLS passthrough)",
+    ]
+    # A plain entry for the same host does not undo the passthrough.
+    assert Allowlist(["github.com", {"host": "github.com", "inspect": False}]).passthrough(
+        "github.com", 443
+    )
+
+
+@pytest.mark.parametrize(
+    ("passthrough", "restricted", "conflict"),
+    [
+        ("github.com", "github.com", True),
+        ("*.github.com", "api.github.com", True),
+        ("api.github.com", "*.github.com", True),
+        ("*.github.com", "*.api.github.com", True),
+        ("*.api.github.com", "*.github.com", True),
+        ("github.com", "*.github.com", False),  # strict subdomains only
+        ("*.github.com", "github.com", False),
+        ("github.com:8443", "github.com", False),  # no common port
+        ("github.com", "github.com:443", True),
+        ("gitlab.com", "github.com", False),
+        ("*.hub.com", "*.github.com", False),
+    ],
+)
+def test_passthrough_cannot_overlap_method_or_path_rules(passthrough, restricted, conflict):
+    entries = [{"host": passthrough, "inspect": False}, {"host": restricted, "methods": ["GET"]}]
+    if not conflict:
+        Allowlist(entries)
+        return
+    with pytest.raises(ValueError, match="could not be enforced") as error:
+        Allowlist(entries)
+    assert "inspect = false" in str(error.value)
