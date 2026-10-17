@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .allowlist import AllowEntry, AllowRule, parse_rule
+from .allowlist import AllowEntry, Allowlist, AllowRule, parse_rule
 from .canary import KINDS
 
 CONFIG_FILE = ".agent-sandbox.toml"
@@ -131,15 +131,25 @@ class SandboxConfig:
     def rules(self) -> list[AllowRule]:
         return [parse_rule(entry, self.default_ports) for entry in self.allow]
 
+    def passthrough(self) -> list[str]:
+        """Host patterns whose HTTPS is relayed without inspection (``inspect = false``)."""
+        return [rule.target for rule in self.rules() if not rule.inspect]
+
     def warnings(self) -> list[str]:
         """Describe settings that are valid but weaker than they look."""
         if self.tls_inspect:
             return []
+        rules = self.rules()
         return [
             f"network.allow: the method/path rule for {rule.describe()} is enforced on plain "
             "HTTP only; HTTPS requests are not visible without [network] tls_inspect = true"
-            for rule in self.rules()
+            for rule in rules
             if rule.restricted
+        ] + [
+            f"network.allow: inspect = false for {rule.target} has no effect without "
+            "[network] tls_inspect = true (no HTTPS is inspected)"
+            for rule in rules
+            if not rule.inspect
         ]
 
     def gateway_settings(self) -> dict[str, Any]:
@@ -200,11 +210,10 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
     ports = network.get("default_ports", [80, 443])
     if not isinstance(ports, list) or not all(isinstance(p, int) and 0 < p < 65536 for p in ports):
         raise ConfigError("network.default_ports must be a list of TCP ports")
-    for entry in allow:
-        try:
-            parse_rule(entry, ports)
-        except ValueError as exc:
-            raise ConfigError(f"network.allow: {exc}") from None
+    try:
+        Allowlist(allow, ports)
+    except ValueError as exc:
+        raise ConfigError(f"network.allow: {exc}") from None
 
     runtime = sandbox.get("runtime", "runc")
     if runtime not in RUNTIMES:
