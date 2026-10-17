@@ -404,7 +404,7 @@ relayed as **opaque TLS**:
 | Still enforced | Not enforced inside the tunnel |
 |---|---|
 | The allowlist (`host:port`), resolution to public addresses only | Canary scanning of requests: **a canary sent through a passthrough tunnel is not detected** |
-| The ClientHello server name must match the `CONNECT` target | Method and path rules (which is why they cannot be combined with `inspect = false`) |
+| The ClientHello server name, when sent, must match the `CONNECT` target | Method and path rules (which is why they cannot be combined with `inspect = false`) |
 | Canaries in the destination host name and in the `CONNECT` request | The `Host` check: domain fronting through a shared front end is possible again |
 | | The HTTP/1.1-only policy: HTTP/2, gRPC and WebSocket work |
 
