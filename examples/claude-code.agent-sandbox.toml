@@ -4,6 +4,16 @@
 [network]
 # The defaults (PyPI, npm, GitHub) stay allowed; add the Anthropic API.
 allow = ["api.anthropic.com"]
+# Optional hardening: decrypt HTTPS so canaries in request bodies are caught
+# and method rules apply to HTTPS too (Claude Code trusts the sandbox CA via
+# NODE_EXTRA_CA_CERTS). With it, GitHub can be made read-only while clone and
+# fetch keep working:
+# tls_inspect = true
+# allow = [
+#   "api.anthropic.com",
+#   { host = "github.com", methods = ["GET", "HEAD"] },
+#   { host = "github.com", methods = ["POST"], paths = ["/*/git-upload-pack"] },
+# ]
 
 [resources]
 cpus = 4
