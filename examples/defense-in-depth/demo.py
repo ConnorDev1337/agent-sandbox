@@ -74,6 +74,7 @@ APPROVAL_ID = re.compile(r"\b(approval|approve|deny) [0-9a-f]{8}\b", re.IGNORECA
 ONE_TIME_CODE = re.compile(r"One-time code: [0-9A-Z-]+")
 TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)?")
 EXPIRY = re.compile(r"expires in \d+s")
+AUDIT_HEAD = re.compile(r"\bhead: [0-9a-f]{64}\b")
 
 
 class DemoError(Exception):
@@ -112,6 +113,7 @@ def sanitize(text: str) -> str:
     text = APPROVAL_ID.sub(r"\1 <id>", text)
     text = ONE_TIME_CODE.sub("One-time code: <redacted>", text)
     text = EXPIRY.sub("expires in <n>s", text)
+    text = AUDIT_HEAD.sub("head: <sha256 of the last record>", text)
     return TIMESTAMP.sub("<time>", text)
 
 

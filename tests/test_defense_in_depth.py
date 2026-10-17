@@ -117,10 +117,12 @@ def test_sanitize_masks_values_that_change_between_runs(demo):
     text = (
         "[2026-10-17T07:55:45] toolguard: approval 3eda1497 for Bash\n"
         "One-time code: B7ZK-K3G7-KN7N (valid until 2026-10-17 08:00:45).\n"
-        "Approve: toolguard approve 3eda1497 [code via file, expires in 299s]"
+        "Approval 3eda1497 requested. Approve: toolguard approve 3eda1497 [expires in 299s]\n"
+        "head: " + "ab" * 32
     )
     clean = demo.sanitize(text)
     assert "3eda1497" not in clean and "B7ZK" not in clean and "2026" not in clean
+    assert "abab" not in clean and "299s" not in clean
     assert "approval <id>" in clean and "One-time code: <redacted>" in clean
 
 
