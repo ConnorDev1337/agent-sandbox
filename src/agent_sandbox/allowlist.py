@@ -43,6 +43,14 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 AllowEntry = str | Mapping[str, Any]
 
 
+def _is_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def normalize_host(host: str) -> str | None:
     """Lowercase hostname without trailing dot, or ``None`` if it is not a valid name.
 
@@ -155,7 +163,7 @@ def _parse_host(entry: str, default_ports: tuple[int, ...]) -> tuple[str, tuple[
         ports = (int(port_text),)
     wildcard = text.startswith("*.")
     host = normalize_host(text[2:] if wildcard else text)
-    if host is None:
+    if host is None or (wildcard and _is_address(host)):
         raise ValueError(f"invalid host in allowlist entry {entry!r}")
     return (f"*.{host}" if wildcard else host), ports
 

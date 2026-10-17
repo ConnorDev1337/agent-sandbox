@@ -223,11 +223,12 @@ def test_no_destination_is_both_passed_through_and_restricted(specs):
 PATTERNS = ["/ok/*", "/*/upload", "/a/*/b", "/exact/path", "/v1/*.json"]
 # Path pieces that servers are known to normalize: dot segments, path
 # parameters (Tomcat), escaped and overlong delimiters, %u escapes (IIS),
-# double encoding, NUL truncation, Windows trailing dots and spaces...
+# double encoding, NUL truncation, Windows trailing dots and spaces... There
+# is no raw "?": rules are matched against the path without the query.
 PIECES = [
     "/", "ok", "a", "b", "x", "upload", "exact", "path", "v1", "f.json", ".", "..", "...",
     ";", ";p", "%2e", "%2E", "%2f", "%5c", "%25", "%252e", "%252f", "%00", "%20", "%3b",
-    "%23", "%3f", "%u002e", "%c0%ae", "%c0%af", "%e0%80%ae", "%61", "\\", "#", "?", "~",
+    "%23", "%3f", "%u002e", "%c0%ae", "%c0%af", "%e0%80%ae", "%61", "\\", "#", "~",
     "\xc0\xae", "..;", "..%00", "..%20", ". .", "%252e%252e", "%c0%ae%c0%ae", "%u002e%u002e",
 ]  # fmt: skip
 segments = st.lists(st.sampled_from(PIECES), min_size=1, max_size=3).map("".join)
