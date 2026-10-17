@@ -59,6 +59,7 @@ def test_ip_literals_must_be_listed_explicitly():
         "pypi.org:" + chr(0x661),
         "pypi.org:\xb2",
         "*.0.1",
+        "*.10.0.0.1",
     ],
 )
 def test_invalid_entries(entry):
