@@ -163,6 +163,63 @@ def test_verify_with_tls_inspection_and_method_rules(capsys, workspace, docker, 
     assert code == 0 and "5/5 checks passed, 1 skipped" in out
 
 
+def test_verify_with_tls_passthrough(capsys, workspace, docker, monkeypatch):
+    (workspace / ".agent-sandbox.toml").write_text(
+        "[network]\ntls_inspect = true\nextend_default_allow = false\n"
+        'allow = [{ host = "pypi.org", inspect = false }, "files.pythonhosted.org"]\n',
+        encoding="utf-8",
+    )
+    config = load(workspace)
+    config.log_dir.mkdir(parents=True)
+    docker.stdout = json.dumps({"check": "a", "ok": True, "detail": "ok"})
+    alerts = [
+        {"ts": "9999-01-01T00:00:00Z", "kind": kind, "severity": "critical", "tls": True}
+        for kind in cli.EXPECTED_ALERTS
+    ]
+    (config.log_dir / "alerts.jsonl").write_text(
+        "\n".join(json.dumps(a) for a in alerts) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    code, out, _ = run(capsys, workspace, "verify", "--no-up")
+    selftest_call = docker.calls[-1]
+    # Canaries are sent to an inspected host; the passthrough host gets its own check.
+    allowed = selftest_call[selftest_call.index("--allowed-host") + 1]
+    assert allowed == "files.pythonhosted.org"
+    assert selftest_call[-2:] == ["--passthrough-host", "pypi.org"]
+    assert code == 1 and "FAIL  gateway logged the TLS passthrough tunnel to pypi.org" in out
+    events = [
+        {"ts": "0001-01-01T00:00:00Z", "kind": "egress.tls_passthrough", "host": "pypi.org"},
+        {"ts": "9999-01-01T00:00:00Z", "kind": "egress.tls_passthrough", "host": "other.org"},
+    ]
+    (config.log_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
+    )
+    assert run(capsys, workspace, "verify", "--no-up")[0] == 1  # too old, or another host
+    events.append({"ts": "9999-01-01T00:00:00Z", "kind": "egress.tls_passthrough",
+                   "host": "pypi.org"})  # fmt: skip
+    (config.log_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
+    )
+    code, out, _ = run(capsys, workspace, "verify", "--no-up")
+    assert code == 0 and "PASS  gateway logged the TLS passthrough tunnel to pypi.org" in out
+
+
+@pytest.mark.parametrize(
+    ("allow", "tls", "expected"),
+    [
+        ('[{ host = "a.example", inspect = false }]', False, None),
+        ('[{ host = "*.a.example", inspect = false }]', True, None),
+        ('[{ host = "a.example:8443", inspect = false }]', True, None),
+        ('["b.example", { host = "a.example", inspect = false }]', True, "a.example"),
+    ],
+)
+def test_passthrough_host(workspace, allow, tls, expected):
+    (workspace / ".agent-sandbox.toml").write_text(
+        f"[network]\ntls_inspect = {str(tls).lower()}\nallow = {allow}\n", encoding="utf-8"
+    )
+    assert cli._passthrough_host(load(workspace)) == expected
+
+
 @pytest.mark.parametrize(
     ("allow", "tls", "expected"),
     [
@@ -209,7 +266,23 @@ def test_config_and_help(capsys, workspace):
     payload = json.loads(out)
     assert code == 0 and payload["gateway_ip"] == "172.31.250.2"
     assert payload["tls_inspect"] is False and payload["undecodable_bodies"] == "allow"
+    assert payload["tls_passthrough"] == []
     assert cli.main([]) == 2
+
+
+def test_passthrough_hosts_in_init_and_config(capsys, workspace):
+    (workspace / ".agent-sandbox.toml").write_text(
+        "[network]\ntls_inspect = true\n"
+        'allow = [{ host = "*.maven.example", inspect = false }, "api.example.com"]\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, workspace, "init")
+    assert code == 0 and err == ""
+    assert "*.maven.example (TLS passthrough)" in out
+    assert "inspected, except *.maven.example (SNI only)" in out
+    payload = json.loads(run(capsys, workspace, "config")[1])
+    assert payload["tls_passthrough"] == ["*.maven.example"]
+    assert {"host": "*.maven.example", "inspect": False} in payload["allow"]
 
 
 def use_runtime(workspace, runtime):

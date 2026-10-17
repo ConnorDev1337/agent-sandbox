@@ -96,6 +96,7 @@ def _args(**values):
         "tls_inspect": False,
         "restricted_host": None,
         "forbidden_method": "DELETE",
+        "passthrough_host": None,
     }
     return type("Args", (), {**defaults, **values})()
 
@@ -128,6 +129,30 @@ def test_tls_checks_with_inspection(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(selftest, "_fetch", lambda url, data=None: (403, "blocked: canary"))
     assert selftest._https_exfiltration(_args(tls_inspect=True))[0] is True
+
+
+def test_tls_passthrough_check(tmp_path, monkeypatch):
+    assert selftest._tls_passthrough(_args(passthrough_host="repo.example"))[0] is None
+    assert selftest._tls_passthrough(_args(tls_inspect=True))[0] is None
+    seen = []
+
+    def issuer(name):
+        def peer_issuer(host, cafile=None):
+            seen.append((host, cafile))
+            return name
+
+        return peer_issuer
+
+    roots = tmp_path / "roots.crt"
+    roots.write_text("-----BEGIN CERTIFICATE-----\n", encoding="ascii")
+    monkeypatch.setattr(selftest, "SYSTEM_BUNDLE", str(roots))
+    args = _args(tls_inspect=True, passthrough_host="r.example")
+    monkeypatch.setattr(selftest, "_peer_issuer", issuer("Let's Encrypt"))
+    ok, detail = selftest._tls_passthrough(args)
+    assert ok is True and detail == "r.example certificate issued by Let's Encrypt"
+    assert seen == [("r.example", str(roots))]  # system roots only, not the sandbox CA
+    monkeypatch.setattr(selftest, "_peer_issuer", issuer("agent-sandbox"))
+    assert selftest._tls_passthrough(args)[0] is False
 
 
 def test_ca_bundle_check_detects_writable_dirs_and_keys(tmp_path, monkeypatch):
