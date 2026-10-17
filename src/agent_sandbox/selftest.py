@@ -32,6 +32,8 @@ from pathlib import Path
 
 EPERM = errno.EPERM
 TIMEOUT = 20.0
+# Debian's system roots in the agent image, without the sandbox CA.
+SYSTEM_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 # Syscall numbers: (x86_64, aarch64).
 SYSCALLS = {
@@ -254,13 +256,18 @@ def _dns_exfiltration(_args):
     return False, "query resolved"
 
 
-def _peer_issuer(host: str) -> str:
-    """Return the organization that issued the certificate seen for ``host`` via the proxy."""
+def _peer_issuer(host: str, cafile: str | None = None) -> str:
+    """Return the organization that issued the certificate seen for ``host`` via the proxy.
+
+    The certificate is verified against ``cafile``, or the default trust store
+    (with TLS inspection, the bundle that includes the sandbox CA).
+    """
     proxy = urllib.parse.urlsplit(os.environ.get("HTTPS_PROXY", ""))
     if not proxy.hostname:
         raise RuntimeError("HTTPS_PROXY is not set")
+    context = ssl.create_default_context(cafile=cafile)
     connection = http.client.HTTPSConnection(
-        proxy.hostname, proxy.port or 3128, timeout=TIMEOUT, context=ssl.create_default_context()
+        proxy.hostname, proxy.port or 3128, timeout=TIMEOUT, context=context
     )
     connection.set_tunnel(host, 443)
     try:
@@ -278,6 +285,18 @@ def _tls_intercepted(args):
         return None, "TLS inspection is off"
     issuer = _peer_issuer(args.allowed_host)
     return issuer == "agent-sandbox", f"{args.allowed_host} certificate issued by {issuer}"
+
+
+@check("TLS passthrough host presents its own certificate")
+def _tls_passthrough(args):
+    if not args.tls_inspect or not args.passthrough_host:
+        return None, "no inspect = false entry in network.allow under TLS inspection"
+    # Verified against the system roots alone: a certificate minted by the
+    # sandbox CA would fail here.
+    cafile = SYSTEM_BUNDLE if Path(SYSTEM_BUNDLE).is_file() else None
+    issuer = _peer_issuer(args.passthrough_host, cafile)
+    ok = issuer != "agent-sandbox"
+    return ok, f"{args.passthrough_host} certificate issued by {issuer}"
 
 
 @check("CA bundle is read-only and holds no private key")
@@ -404,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-inspect", action="store_true")
     parser.add_argument("--restricted-host", default=None)
     parser.add_argument("--forbidden-method", default="DELETE")
+    parser.add_argument("--passthrough-host", default=None)
     parser.add_argument("--runtime", default="runc")
     parser.add_argument("--host-kernel", default=None, help="kernel release of the Docker host")
     args = parser.parse_args(argv)

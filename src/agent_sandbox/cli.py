@@ -37,7 +37,8 @@ SAMPLE_CONFIG = """\
 # { host = "github.com", methods = ["GET", "HEAD"] }
 allow = []
 # Decrypt HTTPS with a per-sandbox CA so canaries in request bodies are caught
-# and method rules apply to HTTPS too (breaks clients that pin certificates).
+# and method rules apply to HTTPS too (breaks clients that pin certificates;
+# relay their hosts uninspected with { host = "...", inspect = false }).
 # tls_inspect = true
 
 [resources]
@@ -157,7 +158,10 @@ def cmd_init(config: SandboxConfig, args: argparse.Namespace) -> int:
     print(f"  state      {config.state_dir}")
     print(f"  canaries   {count} ({'rotated' if args.rotate else 'kept'})")
     print(f"  allowlist  {', '.join(rule.describe() for rule in config.rules())}")
-    print(f"  tls        {'inspected' if config.tls_inspect else 'not inspected (SNI only)'}")
+    tls = "inspected" if config.tls_inspect else "not inspected (SNI only)"
+    if config.tls_inspect and config.passthrough():
+        tls += f", except {', '.join(config.passthrough())} (SNI only)"
+    print(f"  tls        {tls}")
     print(f"  runtime    {config.runtime}")
     return 0
 
@@ -232,14 +236,30 @@ def cmd_alerts(config: SandboxConfig, args: argparse.Namespace) -> int:
 
 
 def _allowed_host(config: SandboxConfig) -> str:
-    """Return the first allowlisted name that accepts any request on ports 80 and 443."""
+    """Return the first allowlisted name that accepts any request on ports 80 and 443.
+
+    Under TLS inspection the name must also be inspected, since the self-test
+    sends canaries over HTTPS that the gateway has to see.
+    """
     allowlist = Allowlist(config.allow, config.default_ports)
     for rule in allowlist.rules:
         if rule.host.startswith("*.") or not {80, 443} <= set(rule.ports):
             continue
+        if config.tls_inspect and allowlist.passthrough(rule.host, 443):
+            continue
         if not (allowlist.restricted(rule.host, 80) or allowlist.restricted(rule.host, 443)):
             return rule.host
     return "pypi.org"
+
+
+def _passthrough_host(config: SandboxConfig) -> str | None:
+    """Return a name relayed without inspection on port 443, for the self-test."""
+    if not config.tls_inspect:
+        return None
+    for rule in config.rules():
+        if not rule.inspect and not rule.host.startswith("*.") and 443 in rule.ports:
+            return rule.host
+    return None
 
 
 def _restricted_target(config: SandboxConfig) -> tuple[str, str] | None:
@@ -277,6 +297,9 @@ def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
     target = _restricted_target(config)
     if target is not None:
         command += ["--restricted-host", target[0], "--forbidden-method", target[1]]
+    passthrough = _passthrough_host(config)
+    if passthrough is not None:
+        command += ["--passthrough-host", passthrough]
     result = run(
         compose_command(config, "exec", "-T", "agent", *command), capture=True, check=False
     )
@@ -298,6 +321,14 @@ def cmd_verify(config: SandboxConfig, args: argparse.Namespace) -> int:
     if config.tls_inspect:
         expected["gateway raised a canary.exfiltration alert for decrypted TLS"] = any(
             a.get("kind") == "canary.exfiltration" and a.get("tls") is True for a in alerts
+        )
+    if passthrough is not None:
+        events = _read_jsonl(config.log_dir / "events.jsonl")
+        expected[f"gateway logged the TLS passthrough tunnel to {passthrough}"] = any(
+            e.get("kind") == "egress.tls_passthrough"
+            and e.get("host") == passthrough
+            and e.get("ts", "") >= started
+            for e in events
         )
     for name, found in expected.items():
         rows.append({"check": name, "ok": found, "detail": "found" if found else "missing"})
@@ -323,6 +354,7 @@ def cmd_config(config: SandboxConfig, _args: argparse.Namespace) -> int:
         "allow": list(config.allow),
         "default_ports": list(config.default_ports),
         "tls_inspect": config.tls_inspect,
+        "tls_passthrough": config.passthrough(),
         "undecodable_bodies": config.undecodable_bodies,
         "runtime": config.runtime,
         "subnet": config.subnet,
