@@ -47,6 +47,9 @@ SYSCALLS = {
 }
 CLONE_NEWUSER = 0x10000000
 AF_PACKET, SOCK_RAW = 17, 3
+# gVisor reports a made-up kernel build instead of the host's; recent releases
+# also end the release with "-gvisor" (e.g. "4.19.0-gvisor").
+GVISOR_VERSION = re.compile(r"Linux version (\S+) #1 SMP Sun Jan 10 15:06:54 PST 2016")
 
 # ``ok`` is None when the check does not apply to this sandbox's configuration.
 Check = Callable[[argparse.Namespace], tuple[bool | None, str]]
@@ -88,11 +91,17 @@ def _nnp_seccomp(_args):
 
 @check("root filesystem is read-only")
 def _read_only_root(_args):
+    # gVisor checks permissions before the mount flags, so a non-root write
+    # fails with EACCES there; the mount flags settle it.
+    read_only = bool(os.statvfs("/").f_flag & os.ST_RDONLY)
     try:
         with open("/usr/local/.agent-sandbox-write-test", "w"):
             pass
     except OSError as exc:
-        return exc.errno == errno.EROFS, os.strerror(exc.errno or 0)
+        detail = os.strerror(exc.errno or 0)
+        if exc.errno == errno.EROFS:
+            return True, detail
+        return read_only, f"{detail}, mounted {'read-only' if read_only else 'read-write'}"
     return False, "write succeeded"
 
 
@@ -123,6 +132,18 @@ def _syscalls(_args):
         if result != -1 or err != EPERM:
             allowed.append(f"{name}(ret={result}, errno={err})")
     return not allowed, "all blocked" if not allowed else "not blocked: " + ", ".join(allowed)
+
+
+@check("agent runs on gVisor's kernel, not the host's")
+def _gvisor_kernel(args):
+    if args.runtime != "runsc":
+        return None, f"runtime is {args.runtime}, not runsc"
+    version = Path("/proc/version").read_text(encoding="utf-8", errors="replace").strip()
+    release = os.uname().release
+    gvisor = bool(GVISOR_VERSION.match(version)) or release.endswith("-gvisor")
+    shared = release == args.host_kernel
+    detail = version + (f" (host: {args.host_kernel})" if args.host_kernel else "")
+    return gvisor and not shared, detail
 
 
 @check("no direct route to the internet")
@@ -363,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-inspect", action="store_true")
     parser.add_argument("--restricted-host", default=None)
     parser.add_argument("--forbidden-method", default="DELETE")
+    parser.add_argument("--runtime", default="runc")
+    parser.add_argument("--host-kernel", default=None, help="kernel release of the Docker host")
     args = parser.parse_args(argv)
     failed = 0
     for name, func in CHECKS:

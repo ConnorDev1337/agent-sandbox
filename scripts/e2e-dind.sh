@@ -12,11 +12,17 @@
 # /etc/docker/daemon.json and reloads dockerd.
 #
 # Usage: sh scripts/e2e-dind.sh [SOURCE_DIR]    (default: the current directory)
+#
+# GVISOR_PLATFORM selects the gVisor platform. The default, systrap, needs its
+# own seccomp user-notification listener and fails ("failed to create a
+# syscall thread") where an ancestor process already holds one, as under
+# Docker Desktop on WSL2; use GVISOR_PLATFORM=ptrace there.
 set -eu
 
 SOURCE_DIR="$(cd "${1:-.}" && pwd)"
 GVISOR_VERSION="${GVISOR_VERSION:-20260928.0}"
 GVISOR_CACHE="${GVISOR_CACHE:-/var/cache/gvisor}"
+GVISOR_PLATFORM="${GVISOR_PLATFORM:-systrap}"
 RUNTIMES="${RUNTIMES-runsc runc}"
 TLS_MODES="${TLS_MODES-false true}"
 WORK_DIR="${WORK_DIR:-/tmp/agent-sandbox-e2e}"
@@ -73,7 +79,7 @@ docker_ready() {
 register_runsc() {
     log "registering runsc in this container's Docker daemon"
     # The OCI seccomp profile is ignored by runsc unless --oci-seccomp is set.
-    /usr/local/bin/runsc install --runtime runsc -- --oci-seccomp
+    /usr/local/bin/runsc install --runtime runsc -- --oci-seccomp --platform="$GVISOR_PLATFORM"
     cat /etc/docker/daemon.json
     if docker_ready; then
         kill -HUP "$(pidof dockerd)"  # runtimes are reloadable
@@ -122,8 +128,8 @@ EOF
     if [ "$status" -ne 0 ]; then
         agent-sandbox -w "$workspace" alerts --events -n 200 || true
         project="$(agent-sandbox -w "$workspace" config | python3 -c \
-            'import json, sys; print(json.load(sys.stdin)["project"])')"
-        docker compose -p "$project" logs --no-color --tail 100 || true
+            'import json, sys; print(json.load(sys.stdin)["project"])')" || project=""
+        [ -z "$project" ] || docker compose -p "$project" logs --no-color --tail 100 || true
     fi
     agent-sandbox -w "$workspace" down --volumes || true
     RESULTS="${RESULTS}runtime=$runtime tls_inspect=$tls exit=$status
