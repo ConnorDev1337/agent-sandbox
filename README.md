@@ -9,38 +9,41 @@ HTTPS requests to allowlisted hosts. With the opt-in **gVisor** runtime, the age
 are served by a user-space kernel instead of the host's.
 
 ```text
-$ agent-sandbox verify          # with tls_inspect = true and a read-only rule for github.com
-PASS  runs as a non-root user                                       uid=1000
-PASS  no capabilities                                               CapEff=0000000000000000 CapBnd=0000000000000000
-PASS  no_new_privs and seccomp filter active                        NoNewPrivs=1 Seccomp=2
-PASS  root filesystem is read-only                                  Read-only file system
-PASS  dangerous syscalls return EPERM                               all blocked
-SKIP  agent runs on gVisor's kernel, not the host's                 runtime is runc, not runsc
-PASS  threads start (clone3 is refused with ENOSYS)                 clone3 failed with ENOSYS
-PASS  no direct route to the internet                               Network is unreachable
-PASS  host is unreachable on the sandbox network                    no answer from 172.31.250.1
-PASS  external DNS is sinkholed                                     [Errno -2] Name or service not known
-PASS  allowlisted host reachable through the proxy                  status=200
-PASS  other hosts are refused by the proxy                          status=None Tunnel connection failed: 403 blocked: example.com:443 is not in the allowlist
-PASS  canary exfiltration is blocked                                status=403 agent-sandbox gateway: blocked: canary credential detected in outbound data
-PASS  canary in a DNS query is caught by the sinkhole               query answered NXDOMAIN (alert expected on the host)
-PASS  HTTPS is re-signed by the sandbox CA (TLS inspection)         pypi.org certificate issued by agent-sandbox
-PASS  CA bundle is read-only and holds no private key               /etc/agent-sandbox/tls/ca-bundle.crt Read-only file system
-PASS  canary in an HTTPS request body is blocked                    status=403 agent-sandbox gateway: blocked: canary credential detected in outbound data
-PASS  forbidden HTTP method is refused                              DELETE https://github.com/ status=403 agent-sandbox gateway: blocked: DELETE / is not allowed for github.com
-PASS  canary in a gzip-encoded request body is blocked              https status=403 agent-sandbox gateway: blocked: canary credential detected in outbound
-PASS  Node.js fetch reaches an allowlisted host through the proxy   node v22.23.3 status=200
-PASS  Node.js fetch to other hosts is refused by the proxy          node v22.23.3 fetch failed: Request was cancelled.: Proxy response (403) !== 200 when HTTP Tunneling
-PASS  gateway raised a canary.exfiltration alert                    found
-PASS  gateway raised a canary.dns alert                             found
-PASS  gateway raised a canary.file_access alert                     found
-PASS  gateway raised a canary.exfiltration alert for decrypted TLS  found
+$ agent-sandbox verify          # tls_inspect = true, github.com read-only, registry.npmjs.org passed through
+PASS  runs as a non-root user                                          uid=1000
+PASS  no capabilities                                                  CapEff=0000000000000000 CapBnd=0000000000000000
+PASS  no_new_privs and seccomp filter active                           NoNewPrivs=1 Seccomp=2
+PASS  root filesystem is read-only                                     Read-only file system
+PASS  dangerous syscalls return EPERM                                  all blocked
+SKIP  agent runs on gVisor's kernel, not the host's                    runtime is runc, not runsc
+PASS  threads start (clone3 is refused with ENOSYS)                    clone3 failed with ENOSYS
+PASS  no direct route to the internet                                  Network is unreachable
+PASS  host is unreachable on the sandbox network                       no answer from 172.31.250.1
+PASS  external DNS is sinkholed                                        [Errno -2] Name or service not known
+PASS  allowlisted host reachable through the proxy                     status=200
+PASS  other hosts are refused by the proxy                             status=None Tunnel connection failed: 403 blocked: example.com:443 is not in the allowlist
+PASS  canary exfiltration is blocked                                   status=403 agent-sandbox gateway: blocked: canary credential detected in outbound data
+PASS  canary in a DNS query is caught by the sinkhole                  query answered NXDOMAIN (alert expected on the host)
+PASS  HTTPS is re-signed by the sandbox CA (TLS inspection)            pypi.org certificate issued by agent-sandbox
+PASS  TLS passthrough host presents its own certificate                registry.npmjs.org certificate issued by Google Trust Services
+PASS  CA bundle is read-only and holds no private key                  /etc/agent-sandbox/tls/ca-bundle.crt Read-only file system
+PASS  canary in an HTTPS request body is blocked                       status=403 agent-sandbox gateway: blocked: canary credential detected in outbound data
+PASS  forbidden HTTP method is refused                                 DELETE https://github.com/ status=403 agent-sandbox gateway: blocked: DELETE / is not allowed for github.com
+PASS  canary in a gzip-encoded request body is blocked                 https status=403 agent-sandbox gateway: blocked: canary credential detected in outbound
+PASS  Node.js fetch reaches an allowlisted host through the proxy      node v22.23.3 status=200
+PASS  Node.js fetch to other hosts is refused by the proxy             node v22.23.3 fetch failed: Request was cancelled.: Proxy response (403) !== 200 when HTTP Tunneling
+PASS  gateway raised a canary.exfiltration alert                       found
+PASS  gateway raised a canary.dns alert                                found
+PASS  gateway raised a canary.file_access alert                        found
+PASS  gateway raised a canary.exfiltration alert for decrypted TLS     found
+PASS  gateway logged the TLS passthrough tunnel to registry.npmjs.org  found
 
-24/24 checks passed, 1 skipped (not enabled in this configuration)
+26/26 checks passed, 1 skipped (not enabled in this configuration)
 ```
 
 Checks that the configuration does not enable are reported as `SKIP` (with the defaults:
-19 checks pass and the five TLS inspection, method rule and gVisor checks are skipped).
+19 checks pass and the six TLS inspection, TLS passthrough, method rule and gVisor checks are
+skipped).
 
 ## Contents
 
@@ -149,6 +152,7 @@ allow = [
   "registry.example:8443",
   { host = "github.com", methods = ["GET", "HEAD"] },                         # read-only...
   { host = "github.com", methods = ["POST"], paths = ["/*/git-upload-pack"] }, # ...but clone/fetch
+  { host = "repo.maven.apache.org", inspect = false },  # TLS passthrough under tls_inspect
 ]
 extend_default_allow = true         # keep PyPI, npm and GitHub
 default_ports = [80, 443]
@@ -182,6 +186,7 @@ An entry can also be a table that limits what may be sent to the host:
 | `host` | Same syntax as a string entry (`name`, `*.domain`, `name:port`) |
 | `methods` | HTTP methods allowed, e.g. `["GET", "HEAD"]` (case-insensitive; `CONNECT` is not a valid value) |
 | `paths` | Glob patterns matched against the request path without the query, e.g. `["/api/*"]` (`*` also matches `/`) |
+| `inspect` | `false` relays HTTPS to the host as opaque TLS under `tls_inspect` (see [TLS passthrough](#tls-passthrough)); default `true` |
 
 Rules only ever **narrow** access: once a table entry with `methods` or `paths` matches a
 destination, a request to it must be permitted by at least one such entry, whatever plain string
@@ -194,6 +199,15 @@ because servers may normalize it differently.
 The gateway can only enforce these rules on requests it can read: always for plain HTTP, and for
 HTTPS only with `tls_inspect = true`. Without inspection, HTTPS tunnels to a restricted host are
 still allowed (the request inside is invisible), and `agent-sandbox up` prints a warning.
+
+`inspect = false` works the other way round: under `tls_inspect`, HTTPS to the matching
+destinations is passed through uninspected. One such entry is enough, whatever other entries
+for the same host say, and a wildcard covers subdomains only, as in the allowlist. Since nothing
+inside a passthrough tunnel is visible, such an entry cannot have `methods` or `paths`, and it
+cannot overlap an entry that has them (for example `*.github.com` passed through and
+`api.github.com` limited to `GET`): both are configuration errors that name the entries.
+Without `tls_inspect`, `inspect = false` has no effect and `agent-sandbox up` warns about it.
+`agent-sandbox config` lists the passthrough hosts under `tls_passthrough`.
 
 `undecodable_bodies` decides what happens to a request body the gateway cannot decode for
 canary scanning (see [Content-Encoding](#content-encoding)): `"block"` refuses the request with
@@ -354,7 +368,8 @@ tunnel:
    filesystem stays read-only. `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
    `GIT_SSL_CAINFO` and `PIP_CERT` point at the bundle and `NODE_EXTRA_CA_CERTS` at the CA. The
    CA is trusted inside the sandbox only, never on the host.
-3. For each `CONNECT`, after the allowlist and SNI checks, the gateway connects upstream with
+3. For each `CONNECT`, after the allowlist and SNI checks (and unless the host is passed
+   through, see [TLS passthrough](#tls-passthrough)), the gateway connects upstream with
    **full certificate verification** (system roots, host name check), then completes the
    agent's handshake with a leaf certificate for that name, minted with the `openssl` CLI on
    first use and cached in memory. A failed upstream verification is answered with a `502` and
@@ -370,7 +385,39 @@ tunnel:
 
 Verified end to end with `pip` (Debian's and a virtualenv's), `npm`, `git clone`, `curl`,
 Python's `urllib` and Node's `fetch`. It is opt-in because it breaks clients that do not use the
-bundle: see [Limitations](#limitations).
+bundle (see [Limitations](#limitations)); hosts those clients need can be passed through.
+
+The certificates are minted with `openssl` commands that work the same with OpenSSL and LibreSSL
+(no `-addext` or `-copy_extensions`; extensions come from configuration files). The gateway image
+uses Debian's OpenSSL 3.0; the test suite also runs against LibreSSL, see
+[Development](#development).
+
+### TLS passthrough
+
+Some clients cannot be pointed at the bundle: Java uses its own `cacerts` keystore, Rust
+programs built with `rustls` and `webpki-roots` (and some Go binaries and CLIs) carry a
+compiled-in root store, and others pin the server's certificate. Under inspection they fail with
+`tls.client_rejected`. A host such a client needs can be marked `{ host = "...", inspect = false }`
+in `[network] allow` (see [Configuration](#configuration)); a `CONNECT` tunnel to it is then
+relayed as **opaque TLS**:
+
+| Still enforced | Not enforced inside the tunnel |
+|---|---|
+| The allowlist (`host:port`), resolution to public addresses only | Canary scanning of requests: **a canary sent through a passthrough tunnel is not detected** |
+| The ClientHello server name must match the `CONNECT` target | Method and path rules (which is why they cannot be combined with `inspect = false`) |
+| Canaries in the destination host name and in the `CONNECT` request | The `Host` check: domain fronting through a shared front end is possible again |
+| | The HTTP/1.1-only policy: HTTP/2, gRPC and WebSocket work |
+
+Each passthrough tunnel is logged as `egress.tls_passthrough` (host, port, server name, client)
+instead of `egress.allowed`, and the passthrough hosts are listed in the `tls.inspection_enabled`
+event at start-up, so uninspected traffic stays visible. Prefer making the client trust the
+sandbox CA where it can: for Java, import `/etc/agent-sandbox/tls/ca.crt` with
+`keytool -importcert` into a copy of `cacerts` in the home directory and point
+`javax.net.ssl.trustStore` at it; Go programs and Rust programs built with `rustls-native-certs`
+already read `SSL_CERT_FILE`. Keep passthrough entries to the hosts that need them and avoid
+broad `*.` patterns.
+`agent-sandbox verify` checks that the first passthrough host presents a certificate that chains
+to the system roots, not to the sandbox CA, while the other HTTPS checks go to an inspected host.
 
 ### Content-Encoding
 
@@ -437,7 +484,7 @@ They are detected:
 - in request lines, headers and bodies of plain HTTP (including chunked bodies), in non-TLS
   `CONNECT` tunnels, in destination host names and in DNS query names;
 - with `tls_inspect`, in request lines, headers, bodies and trailers of HTTPS requests to
-  allowlisted hosts, after decryption;
+  allowlisted hosts, after decryption (not to hosts passed through with `inspect = false`);
 - in request bodies compressed with `gzip` or `deflate`, after decoding;
 - plain or **encoded**: URL encoding, hex, base64 and base64url at every byte alignment, and
   base32/hex split across DNS labels;
@@ -464,9 +511,11 @@ $ agent-sandbox alerts
   Canary alerts carry `"tls": true` when the canary was found in decrypted HTTPS.
 - `events.jsonl` also records each request relayed by an inspecting connection
   (`egress.request`: method, path without query, host), refusals by method or path rules
-  (`egress.denied` with a `path`), failed upstream TLS verification (`egress.tls_error`) and
-  agent clients that rejected the sandbox CA (`tls.client_rejected`). The SHA-256 fingerprint
-  of the sandbox CA is logged at start-up (`tls.inspection_enabled`).
+  (`egress.denied` with a `path`), failed upstream TLS verification (`egress.tls_error`),
+  agent clients that rejected the sandbox CA (`tls.client_rejected`) and tunnels relayed
+  without inspection to `inspect = false` hosts (`egress.tls_passthrough`, with the `sni`).
+  The SHA-256 fingerprint of the sandbox CA, the `openssl` version and the passthrough hosts
+  are logged at start-up (`tls.inspection_enabled`).
 - Refused protocols (HTTP/2, WebSocket and other upgrades) are logged as
   `egress.protocol_refused` with the `protocol`, and bodies that could not be decoded as
   `egress.undecodable_body` with the `encoding`, the `reason` and the `action` taken. A canary
@@ -502,6 +551,7 @@ inside the agent container is not.
 |---|---|
 | Exfiltration to arbitrary hosts | Internal network + allowlist proxy |
 | Credentials sent to an allowlisted host over HTTPS | Canary scanning of decrypted requests (`tls_inspect`) |
+| Credentials sent over HTTPS to a passthrough host (`inspect = false`) | **Not detected**: only the allowlist, public-address and SNI checks apply; every such tunnel is logged (`egress.tls_passthrough`) |
 | Credentials compressed or wrapped to slip past scanning | `gzip`/`deflate` bodies decoded, wrapping and percent escapes normalized, undecodable bodies refused (`undecodable_bodies`) |
 | Write actions on allowlisted services (gists, issues, pushes) | Method and path rules (HTTPS needs `tls_inspect`) |
 | Domain fronting through allowlisted front ends | SNI and `Host` must match the destination |
@@ -535,7 +585,8 @@ with the code afterwards.
 - **What TLS inspection does not cover**:
   - clients that pin certificates or ship their own root store and ignore the environment
     variables above (Java's `cacerts`, some Rust and Go binaries, mobile SDKs) fail to connect;
-    the gateway logs `tls.client_rejected`. There is no per-host bypass;
+    the gateway logs `tls.client_rejected`. Their hosts can be passed through with
+    `inspect = false`, which makes those hosts blind spots: see the next item;
   - HTTP/2 and HTTP/3 are not available (clients fall back to HTTP/1.1; gRPC and other
     HTTP/2-only clients fail), and WebSocket and other `Upgrade` requests are refused: see
     [HTTP/2 and WebSocket](#http2-and-websocket);
@@ -543,6 +594,11 @@ with the code afterwards.
   - request bodies in `br`, `zstd` or other codings than `gzip` and `deflate` are not decoded:
     refused by default under inspection, scanned as sent with `undecodable_bodies = "allow"`;
   - responses are not scanned (they come from the allowlisted server, not from the agent).
+- **TLS passthrough hosts are not inspected.** A canary, or anything else, sent inside a tunnel
+  to an `inspect = false` host is **not** detected, method and path rules cannot apply to it,
+  and a shared front end behind that name can route the request to another backend (domain
+  fronting). Only the allowlist, the public-address check and the server name check apply. Each
+  tunnel is logged as `egress.tls_passthrough`; keep these entries few and specific.
 - **Allowlisted hosts are exfiltration channels** for anything that is not a canary: source code,
   or any data the agent can read, can be sent with every method and path the rules allow
   (an issue comment if `POST` is allowed, a package upload, any API with write access). Method
@@ -584,6 +640,22 @@ python -m agent_sandbox.seccomp --check   # profile matches the generator
 agent-sandbox -w /tmp/demo verify --build # end-to-end on a real Docker daemon
 ```
 
+The certificate tests run once per OpenSSL-compatible binary they find: `openssl` on the `PATH`,
+`/usr/bin/openssl` (LibreSSL on macOS) and every binary listed in `OPENSSL` (separated like
+`PATH`), which must exist. On Alpine, for example:
+
+```bash
+apk add libressl && OPENSSL=/usr/bin/libressl pytest tests/test_tls_inspection.py -v
+```
+
+`gateway/certs.py` was checked this way with OpenSSL 3.5 and LibreSSL 3.3.6 (the release macOS
+ships as `/usr/bin/openssl`, built from the portable tarball), 4.1.2 and 4.3.1 (Alpine 3.22 and
+3.24 packages), in a throwaway Alpine container: the CA and leaf certificates have the same
+extensions and serial numbers with every binary, and pass `openssl verify -x509_strict` and
+Python's `VERIFY_X509_STRICT`. No command needed changing. CI keeps it so: the GitLab `libressl`
+job runs the TLS tests with LibreSSL as the only `openssl`, and the GitHub macOS jobs require
+them to run against `/usr/bin/openssl` too.
+
 [`scripts/e2e-dind.sh`](scripts/e2e-dind.sh) runs `verify --build` under runsc and runc, with
 and without TLS inspection, inside a privileged `docker:dind` container: it installs a pinned
 gVisor release (SHA-512 checked) into that container's own Docker daemon, so the host daemon is
@@ -596,8 +668,8 @@ docker exec agent-sandbox-e2e sh /src/scripts/e2e-dind.sh /src   # GVISOR_PLATFO
 docker rm -f -v agent-sandbox-e2e
 ```
 
-CI: [`.gitlab-ci.yml`](.gitlab-ci.yml) runs lint, unit tests on Python 3.11-3.13 and validates the
-generated Compose file; the manual `gvisor-end-to-end` job runs the script above (it needs a
+CI: [`.gitlab-ci.yml`](.gitlab-ci.yml) runs lint, unit tests on Python 3.11-3.13, the TLS tests
+against LibreSSL and validates the generated Compose file; the manual `gvisor-end-to-end` job runs the script above (it needs a
 privileged runner). The end-to-end test also runs in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (for a future GitHub mirror) and locally.
 
@@ -608,7 +680,7 @@ src/agent_sandbox/
   runtime.py          docker info check for the configured runtime (runc or runsc)
   compose.py          Compose spec (hardening, networks, mounts)
   canary.py           canary generation and encoded-value matching
-  allowlist.py        host:port allowlist with method and path rules
+  allowlist.py        host:port allowlist with method and path rules, TLS passthrough
   seccomp.py          profile generator (+ docker/seccomp/)
   selftest.py         in-container self-test (copied into the agent image)
   gateway/            proxy.py, http1.py (request parsing), tls.py (SNI, ALPN, server-side TLS),
