@@ -618,6 +618,43 @@ def test_ambiguous_hellos_are_malformed(extensions):
     assert server_name(_hello_records(extensions)) is None
 
 
+START = b"\x03\x03" + b"\0" * 32  # legacy_version, random
+SUITES = b"\x00\x02\x13\x01\x01\x00"  # one cipher suite, null compression
+
+
+def _with(extensions: bytes) -> bytes:
+    return START + b"\x00" + SUITES + struct.pack("!H", len(extensions)) + extensions
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (START + b"\x21" + b"\0" * 33 + SUITES, "session id"),
+        (START + b"\x00\x00\x00\x01\x00", "cipher suite"),
+        (START + b"\x00\x00\x03\x13\x01\x00\x01\x00", "cipher suite"),
+        (START + b"\x00\x00\x02\x13\x01\x00", "compression"),
+        (START + b"\x00" + SUITES + b"\x00\x00x", "after the extensions"),
+        (START + b"\x00" + SUITES + b"\x00\x05\x00\x00\x00\x01", "truncated"),
+        (_with(_extension(0, b"\x00\x00")), "empty server name list"),
+        (_with(_extension(0, b"\x00\x04\x01\x00\x01x")), "server name type"),
+        (_with(_extension(0, b"\x00\x04\x00\x00\x01\xe9")), "invalid server name"),
+        (_with(_extension(0, b"\x00\x04\x00\x00\x01\x00")), "invalid server name"),
+        (_with(_extension(16, b"\x00\x00")), "empty ALPN protocol list"),
+        (_with(_extension(16, b"\x00\x02\x02h")), "truncated"),
+        (_with(_extension(16, b"\x00\x01\x00")), "empty ALPN protocol name"),
+        (_with(_extension(16, b"\x00\x02\x01h\x00")), "after the ALPN"),
+    ],
+)
+def test_malformed_hello_fields(body, reason):
+    message = b"\x01" + len(body).to_bytes(3, "big") + body
+    with pytest.raises(MalformedHello, match=reason):
+        parse_client_hello(b"\x16\x03\x01" + struct.pack("!H", len(message)) + message)
+    with pytest.raises(MalformedHello, match="not a ClientHello"):
+        parse_client_hello(
+            b"\x16\x03\x01" + struct.pack("!H", len(message)) + b"\x02" + message[1:]
+        )
+
+
 @pytest.mark.parametrize(
     "hello",
     [
