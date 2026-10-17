@@ -20,7 +20,7 @@ import pytest
 from agent_sandbox.canary import generate
 from agent_sandbox.gateway import certs
 from agent_sandbox.gateway.alerts import EventLog
-from test_gateway import ProxyHarness, read_jsonl
+from test_gateway import ProxyHarness, _client_hello, read_jsonl
 
 pytestmark = pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl not installed")
 
@@ -358,3 +358,64 @@ def test_minting_failure_closes_the_tunnel(inspecting, tls_upstream, sandbox_ca,
             break
         threading.Event().wait(0.05)
     assert any(e["kind"] == "tls.error" and "exploded" in e["error"] for e in events)
+
+
+# ---------------------------------------------------------------------------- passthrough
+
+
+def wait_for_event(log, kind):
+    for _ in range(50):
+        events = read_jsonl(log.directory / "events.jsonl")
+        if any(e["kind"] == kind for e in events):
+            return events
+        threading.Event().wait(0.05)
+    raise AssertionError(f"no {kind} event")
+
+
+def test_passthrough_hosts_get_the_upstream_certificate(
+    inspecting, tls_upstream, upstream_ca, canaries, log
+):
+    target = f"127.0.0.1:{tls_upstream}"
+    secret = next(c for c in canaries if c.kind == "aws").secrets[1]
+    body = f"k={secret}".encode()
+    payload = (
+        f"POST /upload HTTP/1.1\r\nHost: {target}\r\nContent-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode() + body
+    h = inspecting({"inspect": False})
+    # A client that trusts only the upstream CA completes its handshake with the
+    # real server, as a client that pins its certificate would.
+    response, alpn = https(h.port, target, payload, str(upstream_ca.cert))
+    assert response.endswith(b"hello over tls") and alpn is None
+    # The documented trade-off: a canary inside the tunnel is not visible.
+    assert TLSUpstream.received[0][2] == body
+    assert read_jsonl(log.directory / "alerts.jsonl") == []
+    events = wait_for_event(log, "egress.tls_passthrough")
+    kinds = [e["kind"] for e in events]
+    assert "egress.allowed" not in kinds and "egress.request" not in kinds
+    passed = next(e for e in events if e["kind"] == "egress.tls_passthrough")
+    assert passed["host"] == "127.0.0.1" and passed["port"] == tls_upstream
+    assert passed["sni"] is None  # no SNI for an IP address
+
+
+def test_passthrough_skips_the_http_1_only_policy(inspecting, tls_upstream, upstream_ca, log):
+    target = f"127.0.0.1:{tls_upstream}"
+    h = inspecting({"inspect": False})
+    payload = f"GET / HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode()
+    response, _ = https(h.port, target, payload, str(upstream_ca.cert), alpn=["h2"])
+    assert response.endswith(b"hello over tls")
+    kinds = [e["kind"] for e in wait_for_event(log, "egress.tls_passthrough")]
+    assert "egress.protocol_refused" not in kinds
+
+
+def test_passthrough_still_checks_the_server_name(inspecting, tls_upstream, log):
+    h = inspecting({"inspect": False})
+    h.raw(
+        f"CONNECT 127.0.0.1:{tls_upstream} HTTP/1.1\r\n\r\n".encode(),
+        read_after=_client_hello("evil.example"),
+    )
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["kind"] == "egress.sni_mismatch" and alert["sni"] == "evil.example"
+    kinds = [e["kind"] for e in read_jsonl(log.directory / "events.jsonl")]
+    assert "egress.tls_passthrough" not in kinds
+    assert TLSUpstream.received == []

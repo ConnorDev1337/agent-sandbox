@@ -6,11 +6,12 @@ sends that the gateway can read (request lines, headers, plain-HTTP bodies,
 non-TLS tunnels, TLS SNI) is scanned for canary values.
 
 Requests the gateway can parse (plain HTTP, plaintext tunnels to hosts with
-method or path rules and, with TLS inspection, every HTTPS tunnel) are
-relayed one by one so the allowlist rules and the ``Host`` header can be
-enforced on each of them. Their bodies are also scanned decoded when they
-carry a ``Content-Encoding``; a body that cannot be decoded is refused or
-forwarded scanned as sent, depending on the ``undecodable_bodies`` policy.
+method or path rules and, with TLS inspection, every HTTPS tunnel except those
+to hosts marked ``inspect = false``) are relayed one by one so the allowlist
+rules and the ``Host`` header can be enforced on each of them. Their bodies
+are also scanned decoded when they carry a ``Content-Encoding``; a body that
+cannot be decoded is refused or forwarded scanned as sent, depending on the
+``undecodable_bodies`` policy.
 """
 
 from __future__ import annotations
@@ -392,6 +393,7 @@ class Proxy:
 
         first = await asyncio.wait_for(reader.read(CHUNK), self.idle_timeout)
         tls = looks_like_tls(first)
+        passthrough = False
         if tls:
             first = await self._read_hello(reader, first)
             sni = server_name(first)
@@ -407,10 +409,21 @@ class Proxy:
                 upstream_writer.close()
                 return
             if self.tls_issuer is not None:
-                await self._intercept(
-                    first, reader, writer, upstream_reader, upstream_writer, host, port, client
+                if not self.allowlist.passthrough(host, port):
+                    await self._intercept(
+                        first, reader, writer, upstream_reader, upstream_writer, host, port, client
+                    )
+                    return
+                # Relayed as opaque TLS (inspect = false): only the checks above apply.
+                passthrough = True
+                self.log.event(
+                    "egress.tls_passthrough",
+                    host=host,
+                    port=port,
+                    method="CONNECT",
+                    sni=sni,
+                    client=client,
                 )
-                return
         else:
             first = await self._read_start(reader, first)
             if self.allowlist.restricted(host, port) or request_start(first):
@@ -430,7 +443,8 @@ class Proxy:
                 )
                 return
             self._check_canaries(first, client, where="tunnel data", host=host)
-        self.log.event("egress.allowed", host=host, port=port, method="CONNECT", client=client)
+        if not passthrough:
+            self.log.event("egress.allowed", host=host, port=port, method="CONNECT", client=client)
         upstream_writer.write(first)
         await upstream_writer.drain()
         try:

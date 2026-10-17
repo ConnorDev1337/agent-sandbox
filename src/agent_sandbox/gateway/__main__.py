@@ -45,14 +45,18 @@ async def _run(args: argparse.Namespace) -> None:
         tripwire.arm()  # Watches exist before the proxy accepts connections
         tripwire.start()
 
+    allowlist = Allowlist(config.get("allow", []), config.get("default_ports", (80, 443)))
     issuer = None
     if config.get("tls_inspect"):
         # Ready before the proxy listens, so the agent never starts without its bundle.
         workdir = Path(tempfile.mkdtemp(prefix="agent-sandbox-tls-"))
         issuer = certs.prepare(args.ca_dir, args.tls_dir, workdir)
-        log.event("tls.inspection_enabled", ca_fingerprint=issuer.ca.fingerprint())
+        log.event(
+            "tls.inspection_enabled",
+            ca_fingerprint=issuer.ca.fingerprint(),
+            passthrough=[rule.target for rule in allowlist.rules if not rule.inspect],
+        )
 
-    allowlist = Allowlist(config.get("allow", []), config.get("default_ports", (80, 443)))
     server = await proxy.serve(
         proxy.Proxy(
             allowlist,
