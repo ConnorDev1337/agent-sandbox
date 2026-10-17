@@ -25,16 +25,19 @@ PASS  HTTPS is re-signed by the sandbox CA (TLS inspection)         pypi.org cer
 PASS  CA bundle is read-only and holds no private key               /etc/agent-sandbox/tls/ca-bundle.crt Read-only file system
 PASS  canary in an HTTPS request body is blocked                    status=403 agent-sandbox gateway: blocked: canary credential detected in outbound data
 PASS  forbidden HTTP method is refused                              DELETE https://github.com/ status=403 agent-sandbox gateway: blocked: DELETE / is not allowed for github.com
+PASS  canary in a gzip-encoded request body is blocked              https status=403 agent-sandbox gateway: blocked: canary credential detected in outbound
+PASS  Node.js fetch reaches an allowlisted host through the proxy   node v22.23.3 status=200
+PASS  Node.js fetch to other hosts is refused by the proxy          node v22.23.3 fetch failed: Request was cancelled.: Proxy response (403) !== 200 when HTTP Tunneling
 PASS  gateway raised a canary.exfiltration alert                    found
 PASS  gateway raised a canary.dns alert                             found
 PASS  gateway raised a canary.file_access alert                     found
 PASS  gateway raised a canary.exfiltration alert for decrypted TLS  found
 
-20/20 checks passed
+23/23 checks passed
 ```
 
 Checks that the configuration does not enable are reported as `SKIP` (with the defaults:
-15 checks pass and the four TLS inspection and method rule checks are skipped).
+18 checks pass and the four TLS inspection and method rule checks are skipped).
 
 ## Contents
 
@@ -118,10 +121,12 @@ agent-sandbox run -- bash -lc '~/.local/bin/claude'
 ```
 
 The root filesystem is read-only, so tools are installed under the home directory (a persistent
-volume). `pip`, `npm` and `git` honor the proxy variables; Node's built-in `fetch` does too
-through `NODE_USE_ENV_PROXY=1` on Node.js 22.21 or later (the default image ships Node.js 18,
-where `fetch` ignores the proxy and fails to resolve names). Claude Code and other Node.js clients
-trust the sandbox CA through `NODE_EXTRA_CA_CERTS` when TLS inspection is on.
+volume). `pip`, `npm` and `git` honor the proxy variables, and so does Node's built-in `fetch`:
+the default image ships Node.js 22 LTS (from the official `node:22-bookworm-slim` image, pinned
+by digest), and the Compose file sets `NODE_USE_ENV_PROXY=1`, which Node.js 22.21 and later need
+to route `fetch` through `HTTPS_PROXY`. A custom `agent_image` with an older Node.js has `fetch`
+ignore the proxy and fail to resolve names. Claude Code and other Node.js clients trust the
+sandbox CA through `NODE_EXTRA_CA_CERTS` when TLS inspection is on.
 
 ## Configuration
 
@@ -144,6 +149,7 @@ extend_default_allow = true         # keep PyPI, npm and GitHub
 default_ports = [80, 443]
 subnet = "172.31.250.0/24"          # private IPv4, /28 or larger
 tls_inspect = false                 # true: decrypt HTTPS to scan bodies and enforce method rules
+undecodable_bodies = "allow"        # or "block"; default "block" with tls_inspect (see below)
 
 [resources]
 cpus = 2
@@ -183,6 +189,13 @@ because servers may normalize it differently.
 The gateway can only enforce these rules on requests it can read: always for plain HTTP, and for
 HTTPS only with `tls_inspect = true`. Without inspection, HTTPS tunnels to a restricted host are
 still allowed (the request inside is invisible), and `agent-sandbox up` prints a warning.
+
+`undecodable_bodies` decides what happens to a request body the gateway cannot decode for
+canary scanning (see [Content-Encoding](#content-encoding)): `"block"` refuses the request with
+an `egress.undecodable_body` alert; `"allow"` forwards it, scanned as sent, and logs the same
+kind as an event. The default is `"block"` with `tls_inspect = true`, since inspection is the
+opt-in to content scanning, and `"allow"` without it, since HTTPS is not scanned at all then and
+blocking plain HTTP alone would add friction without closing a channel.
 
 ## Security layers
 
@@ -229,6 +242,10 @@ Debuggers such as `gdb` and `strace` do not work inside the sandbox as a result.
   packets or TLS records does not hide the name. In every request the gateway can read, the
   `Host` header (and an absolute request target) must name the destination too, so a shared
   front end (CDN, load balancer) cannot be used to reach another backend (domain fronting).
+- **Plaintext tunnels**: a non-TLS `CONNECT` tunnel that starts with an HTTP/1 request (Node's
+  `fetch` tunnels even `http://` URLs) is relayed request by request like plain HTTP, so method
+  and path rules, the `Host` check and body decoding apply. Other plaintext protocols are relayed
+  as a byte stream and scanned as is.
 - **Strict request parsing**: requests the gateway forwards are parsed strictly (no bare CR or LF,
   no whitespace before a colon, no conflicting `Content-Length` and `Transfer-Encoding`, no exotic
   chunk sizes), so the gateway and the server cannot disagree about where a request ends.
@@ -253,16 +270,64 @@ tunnel:
    agent's handshake with a leaf certificate for that name, minted with the `openssl` CLI on
    first use and cached in memory. A failed upstream verification is answered with a `502` and
    logged.
-4. Only `http/1.1` is offered over ALPN, so every request can be parsed. Each one gets the same
-   treatment as plain HTTP: canary scanning of the request line, headers, body and trailers,
-   method and path rules, and the `Host` check. Bodies up to 10 MiB are held until fully scanned,
-   so a request carrying a canary never reaches the server; larger bodies (uploads, `git push`)
-   are streamed with enough data held back that a canary is caught before any part of it leaves,
-   and the server only sees a truncated request.
+4. Only `http/1.1` is offered over ALPN, so every request can be parsed (see
+   [HTTP/2 and WebSocket](#http2-and-websocket)). Each one gets the same treatment as plain HTTP:
+   canary scanning of the request line, headers, body (decoded too, see
+   [Content-Encoding](#content-encoding)) and trailers, method and path rules, and the `Host`
+   check. Bodies up to 10 MiB are held until fully scanned, so a request carrying a canary never
+   reaches the server; larger bodies (uploads, `git push`) are streamed with enough data held back
+   that a canary is caught before any part of it leaves, and the server only sees a truncated
+   request.
 
-Verified end to end with `pip` (Debian's and a virtualenv's), `npm`, `git clone`, `curl` and
-Python's `urllib`. It is opt-in because it breaks clients that do not use the bundle: see
-[Limitations](#limitations).
+Verified end to end with `pip` (Debian's and a virtualenv's), `npm`, `git clone`, `curl`,
+Python's `urllib` and Node's `fetch`. It is opt-in because it breaks clients that do not use the
+bundle: see [Limitations](#limitations).
+
+### Content-Encoding
+
+A canary inside a compressed request body does not appear in the bytes as sent, so every body
+the gateway reads (plain HTTP, plaintext tunnels and, with `tls_inspect`, HTTPS) that carries a
+`Content-Encoding` is also decoded and scanned:
+
+- `gzip` (and `x-gzip`, including concatenated members) and `deflate` are decoded with the
+  standard library, stacked up to three times (`Content-Encoding: deflate, gzip`). `deflate` is
+  read zlib-wrapped when it starts with a zlib header and raw otherwise, as servers disagree; a
+  body crafted to be valid both ways is refused.
+- Decoding is streamed and bounded: output is produced 64 KiB at a time, and a body is refused
+  once any layer decodes to more than 64 MiB, or to more than 100 times the bytes sent (past the
+  first MiB). A decompression bomb costs the gateway little memory or CPU.
+- For a streamed upload, a byte is only forwarded once everything a server could decode from the
+  body up to that byte has been scanned, so a body refused half-way never hands the server part
+  of a canary.
+- Anything else is **undecodable**: `br`, `zstd`, `compress` or unknown codings, malformed or
+  truncated data, and bodies over the limits. `[network] undecodable_bodies` decides whether
+  such a request is refused (`415`, `413` or `400`, with an `egress.undecodable_body` alert) or
+  forwarded scanned as sent. Brotli would need a third-party C extension in the gateway and
+  zstd Python 3.14, for codings clients rarely use on requests.
+
+### HTTP/2 and WebSocket
+
+Under inspection the gateway speaks HTTP/1.1 only, and refuses the rest with an
+`egress.protocol_refused` event and an answer clients understand:
+
+| Client behavior | Gateway answer |
+|---|---|
+| Offers `h2` and `http/1.1` over ALPN (curl, Node, Go, Python, browsers) | `http/1.1` is selected; the client falls back without noticing |
+| Offers `h2` only (gRPC and other HTTP/2-only clients) | TLS alert `no_application_protocol` |
+| Sends the HTTP/2 preface without negotiation (prior knowledge, also in plaintext tunnels) | HTTP/2 `GOAWAY` with `HTTP_1_1_REQUIRED` |
+| `Upgrade:` request (WebSocket, `h2c`) | `501` |
+
+HTTP/2 was evaluated and left out on purpose. Translating it to HTTP/1.1 upstream (for example
+with the pure-Python `h2` library) would only help clients that cannot fall back, and those are
+mostly gRPC clients, which need HTTP/2 to the server as well (trailers carry the call status, and
+gRPC servers do not speak HTTP/1.1). Proxying HTTP/2 end to end means two HTTP/2 state machines
+with bridged flow control, a third-party parser (`h2`, `hpack`, `hyperframe`) in the gateway,
+which is otherwise standard library only, and defenses the library does not provide against the
+known HTTP/2 denial-of-service classes (rapid reset, CONTINUATION and HPACK floods, PING and
+SETTINGS floods, flow-control stalls). Every request would end up in the same scanning pipeline,
+so detection would not improve; only gRPC would start working. WebSocket frames are masked,
+fragmented and possibly compressed per message (`permessage-deflate`), and the connection stays
+open in both directions, so they cannot be held and scanned like a request body.
 
 ### Canary tokens
 
@@ -284,8 +349,12 @@ They are detected:
   `CONNECT` tunnels, in destination host names and in DNS query names;
 - with `tls_inspect`, in request lines, headers, bodies and trailers of HTTPS requests to
   allowlisted hosts, after decryption;
+- in request bodies compressed with `gzip` or `deflate`, after decoding;
 - plain or **encoded**: URL encoding, hex, base64 and base64url at every byte alignment, and
   base32/hex split across DNS labels;
+- **wrapped**: whitespace and quoted-printable soft line breaks are ignored (the output of
+  `base64`, MIME parts with `Content-Transfer-Encoding`, hex dumps), and data around percent
+  escapes is also searched percent-decoded (partial or excessive URL encoding);
 - with an inotify **tripwire** on the files themselves: opening a canary file raises a warning
   (except `~/.netrc`, which curl and git read on their own).
 
@@ -309,6 +378,10 @@ $ agent-sandbox alerts
   (`egress.denied` with a `path`), failed upstream TLS verification (`egress.tls_error`) and
   agent clients that rejected the sandbox CA (`tls.client_rejected`). The SHA-256 fingerprint
   of the sandbox CA is logged at start-up (`tls.inspection_enabled`).
+- Refused protocols (HTTP/2, WebSocket and other upgrades) are logged as
+  `egress.protocol_refused` with the `protocol`, and bodies that could not be decoded as
+  `egress.undecodable_body` with the `encoding`, the `reason` and the `action` taken. A canary
+  found after decoding has an `encoding` such as `plain in gzip`.
 - With `[alerts] webhook`, each alert is also POSTed as JSON (`{"text": ..., "alert": {...}}`,
   compatible with Slack incoming webhooks).
 - `agent-sandbox alerts --fail` exits 1 if there is a critical alert, for use in scripts.
@@ -321,6 +394,7 @@ $ agent-sandbox alerts
 | `egress.sni_mismatch` | warning | TLS server name differs from the `CONNECT` target |
 | `egress.host_mismatch` | warning | A request's `Host` header names another host than its connection |
 | `egress.private_address` | warning | An allowlisted name resolved only to non-public addresses |
+| `egress.undecodable_body` | warning | A request body could not be decoded for scanning and was refused |
 
 ## Threat model
 
@@ -339,6 +413,7 @@ inside the agent container is not.
 |---|---|
 | Exfiltration to arbitrary hosts | Internal network + allowlist proxy |
 | Credentials sent to an allowlisted host over HTTPS | Canary scanning of decrypted requests (`tls_inspect`) |
+| Credentials compressed or wrapped to slip past scanning | `gzip`/`deflate` bodies decoded, wrapping and percent escapes normalized, undecodable bodies refused (`undecodable_bodies`) |
 | Write actions on allowlisted services (gists, issues, pushes) | Method and path rules (HTTPS needs `tls_inspect`) |
 | Domain fronting through allowlisted front ends | SNI and `Host` must match the destination |
 | DNS tunnelling | DNS sinkhole |
@@ -362,10 +437,11 @@ Docker daemon, and what the user does with the code afterwards.
     variables above (Java's `cacerts`, some Rust and Go binaries, mobile SDKs) fail to connect;
     the gateway logs `tls.client_rejected`. There is no per-host bypass;
   - HTTP/2 and HTTP/3 are not available (clients fall back to HTTP/1.1; gRPC and other
-    HTTP/2-only clients fail), and WebSocket and other `Upgrade` requests are refused;
+    HTTP/2-only clients fail), and WebSocket and other `Upgrade` requests are refused: see
+    [HTTP/2 and WebSocket](#http2-and-websocket);
   - non-HTTP protocols inside TLS tunnels are refused, not scanned;
-  - compressed or encrypted request bodies (`Content-Encoding: gzip`, client-side encryption)
-    are scanned as is, so a canary inside them is missed;
+  - request bodies in `br`, `zstd` or other codings than `gzip` and `deflate` are not decoded:
+    refused by default under inspection, scanned as sent with `undecodable_bodies = "allow"`;
   - responses are not scanned (they come from the allowlisted server, not from the agent).
 - **Allowlisted hosts are exfiltration channels** for anything that is not a canary: source code,
   or any data the agent can read, can be sent with every method and path the rules allow
@@ -376,8 +452,11 @@ Docker daemon, and what the user does with the code afterwards.
 - **Path rules are textual**: patterns match the raw request path. Ambiguous paths are refused,
   but a server that routes the same path to different handlers (for example by a header) can
   still be reached through an allowed path.
-- **Encoding coverage is finite**: compression, encryption or custom encodings defeat canary
-  matching. Canaries are tripwires, not a guarantee.
+- **Encoding coverage is finite**: encryption, custom encodings (a reversed or XORed value,
+  JSON `\u` escapes, archives such as zip or tar.gz uploaded as a file) and compression the
+  gateway does not decode defeat canary matching, and so does a value padded with more
+  whitespace or escapes than the scanner holds back at a chunk boundary (three times the
+  longest encoded value). Canaries are tripwires, not a guarantee.
 - **Shared kernel.** seccomp reduces the attack surface but a kernel exploit escapes any
   container. For stronger isolation, run the agent under gVisor or Kata Containers.
 - **The workspace is writable.** The agent can change any file in your project, including build
@@ -413,8 +492,9 @@ src/agent_sandbox/
   allowlist.py        host:port allowlist with method and path rules
   seccomp.py          profile generator (+ docker/seccomp/)
   selftest.py         in-container self-test (copied into the agent image)
-  gateway/            proxy.py, http1.py (request parsing), tls.py (SNI, server-side TLS),
-                      certs.py (CA and leaf certificates), dns.py, tripwire.py, alerts.py
+  gateway/            proxy.py, http1.py (request parsing), tls.py (SNI, ALPN, server-side TLS),
+                      certs.py (CA and leaf certificates), decoding.py (Content-Encoding),
+                      dns.py, tripwire.py, alerts.py
   docker/             agent.Dockerfile, gateway.Dockerfile (base images pinned by digest)
 tests/                unit tests for every module
 examples/             configuration for running Claude Code in the sandbox
