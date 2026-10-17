@@ -11,7 +11,10 @@ _HANDSHAKE = 0x16
 _READ_SIZE = 64 * 1024
 _CLIENT_HELLO = 0x01
 _SERVER_NAME = 0x0000
+_ALPN = 0x0010
 MAX_HELLO = 64 * 1024  # Larger first handshake messages are not legitimate ClientHellos
+# Fatal no_application_protocol alert (RFC 7301), sent in the clear before the handshake.
+NO_APPLICATION_PROTOCOL = b"\x15\x03\x03\x00\x02\x02\x78"
 
 
 def looks_like_tls(data: bytes) -> bool:
@@ -52,8 +55,8 @@ def hello_complete(data: bytes) -> bool:
     return False
 
 
-def server_name(data: bytes) -> str | None:
-    """Return the SNI host name of a ClientHello, or ``None`` if absent or unparsable."""
+def _extension(data: bytes, wanted: int) -> bytes | None:
+    """Return the body of the first ClientHello extension of type ``wanted``, if any."""
     message = handshake_message(data) if looks_like_tls(data) else None
     try:
         if message is None or message[0] != _CLIENT_HELLO:
@@ -70,20 +73,45 @@ def server_name(data: bytes) -> str | None:
         while pos + 4 <= end:
             ext_type, ext_len = struct.unpack_from("!HH", message, pos)
             pos += 4
-            if ext_type == _SERVER_NAME:
-                (list_len,) = struct.unpack_from("!H", message, pos)
-                cursor, list_end = pos + 2, pos + 2 + list_len
-                while cursor + 3 <= list_end:
-                    name_type, name_len = struct.unpack_from("!BH", message, cursor)
-                    cursor += 3
-                    if name_type == 0:
-                        return message[cursor : cursor + name_len].decode("ascii").lower()
-                    cursor += name_len
-                return None
+            if ext_type == wanted:
+                return message[pos : pos + ext_len]
             pos += ext_len
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
+def server_name(data: bytes) -> str | None:
+    """Return the SNI host name of a ClientHello, or ``None`` if absent or unparsable."""
+    extension = _extension(data, _SERVER_NAME)
+    try:
+        if extension is None:
+            return None
+        (list_len,) = struct.unpack_from("!H", extension)
+        cursor, list_end = 2, 2 + list_len
+        while cursor + 3 <= list_end:
+            name_type, name_len = struct.unpack_from("!BH", extension, cursor)
+            cursor += 3
+            if name_type == 0:
+                return extension[cursor : cursor + name_len].decode("ascii").lower()
+            cursor += name_len
     except (IndexError, struct.error, UnicodeDecodeError):
         return None
     return None
+
+
+def alpn_protocols(data: bytes) -> list[str] | None:
+    """Return the ALPN protocols a ClientHello offers, or ``None`` if it offers none."""
+    extension = _extension(data, _ALPN)
+    if extension is None or len(extension) < 2:
+        return None
+    names = []
+    cursor, end = 2, min(2 + int.from_bytes(extension[:2], "big"), len(extension))
+    while cursor < end:
+        size = extension[cursor]
+        names.append(extension[cursor + 1 : cursor + 1 + size].decode("ascii", "replace"))
+        cursor += 1 + size
+    return names
 
 
 class TLSServerSession:

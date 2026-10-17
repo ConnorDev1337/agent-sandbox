@@ -19,7 +19,7 @@ from agent_sandbox.canary import CanaryMatcher, generate
 from agent_sandbox.gateway import dns
 from agent_sandbox.gateway.alerts import EventLog
 from agent_sandbox.gateway.proxy import Proxy, parse_head, split_host_port
-from agent_sandbox.gateway.tls import MAX_HELLO, hello_complete, server_name
+from agent_sandbox.gateway.tls import MAX_HELLO, alpn_protocols, hello_complete, server_name
 from agent_sandbox.gateway.tripwire import Tripwire, parse_events, seed
 
 
@@ -329,17 +329,59 @@ def test_canary_hostname_is_blocked(harness, canaries, log):
 def test_connect_tunnel_scans_plaintext(harness, upstream, canaries, log):
     secret = next(c for c in canaries if c.kind == "netrc").secrets[0]
     h = harness([f"127.0.0.1:{upstream}"])
-    ok = h.raw(
-        f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode(),
-        read_after=b"GET /t HTTP/1.1\r\nHost: x\r\n\r\n",
-    )
-    assert b"hello from upstream" in ok
     blocked = h.raw(
         f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode(),
-        read_after=f"POST /t HTTP/1.1\r\nContent-Length: 28\r\n\r\n{secret}".encode(),
+        read_after=f"SSH-2.0-client\r\n{secret}".encode(),
     )
     assert b"hello from upstream" not in blocked
     assert read_jsonl(log.directory / "alerts.jsonl")[-1]["where"] == "tunnel data"
+
+
+def test_http_in_plaintext_tunnel_is_parsed(harness, keepalive_upstream, canaries, log):
+    secret = next(c for c in canaries if c.kind == "netrc").secrets[0]
+    target = f"127.0.0.1:{keepalive_upstream}"
+    h = harness([target])
+    ok = h.raw(
+        f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(),
+        read_after=f"GET /t HTTP/1.1\r\nHost: {target}\r\n\r\n".encode(),
+    )
+    assert b"hello from upstream" in ok
+    body = gzip.compress(secret.encode())
+    request = (
+        f"POST /t HTTP/1.1\r\nHost: {target}\r\nContent-Encoding: gzip\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    blocked = h.raw(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(), read_after=request)
+    assert blocked.startswith(b"HTTP/1.1 403")
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["where"] == "request body" and alert["encoding"] == "plain in gzip"
+    assert [r[1] for r in Upstream.received] == ["/t"]
+
+
+def test_request_line_split_across_reads_is_still_parsed(harness, upstream, log):
+    target = f"127.0.0.1:{upstream}"
+    h = harness([target])
+    with socket.create_connection(("127.0.0.1", h.port), timeout=5) as sock:
+        sock.sendall(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode())
+        assert sock.recv(4096).startswith(b"HTTP/1.1 200")
+        sock.sendall(b"DEL")
+        time.sleep(0.2)
+        sock.sendall(b"ETE /t HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        assert sock.recv(4096).startswith(b"HTTP/1.1 403")
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["kind"] == "egress.host_mismatch"
+
+
+def test_http2_prior_knowledge_is_refused_with_goaway(harness, upstream, log):
+    target = f"127.0.0.1:{upstream}"
+    h = harness([target])
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    frames = h.raw(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(), read_after=preface)
+    assert frames[3] == 0x4 and frames[12] == 0x7  # SETTINGS, then GOAWAY
+    assert frames.endswith(b"\x00\x00\x00\x0d")  # HTTP_1_1_REQUIRED
+    event = read_jsonl(log.directory / "events.jsonl")[-1]
+    assert event["kind"] == "egress.protocol_refused" and event["protocol"].startswith("h2")
+    assert not Upstream.received
 
 
 def _restricted(port, *rules):
@@ -456,11 +498,14 @@ def test_connect_denied_and_unreachable(harness, log):
     assert h.raw(b"GET ftp://x.example/ HTTP/1.1\r\n\r\n").startswith(b"HTTP/1.1 400")
 
 
-def _client_hello(sni: str) -> bytes:
+def _client_hello(sni: str, alpn: tuple[str, ...] = ()) -> bytes:
     name = sni.encode()
-    sni_ext = struct.pack("!HHHBH", 0, len(name) + 5, len(name) + 3, 0, len(name)) + name
+    extensions = struct.pack("!HHHBH", 0, len(name) + 5, len(name) + 3, 0, len(name)) + name
+    if alpn:
+        names = b"".join(bytes([len(p)]) + p.encode() for p in alpn)
+        extensions += struct.pack("!HHH", 16, len(names) + 2, len(names)) + names
     body = b"\x03\x03" + b"\0" * 32 + b"\x00" + b"\x00\x02\x13\x01" + b"\x01\x00"
-    body += struct.pack("!H", len(sni_ext)) + sni_ext
+    body += struct.pack("!H", len(extensions)) + extensions
     handshake = b"\x01" + len(body).to_bytes(3, "big") + body
     return b"\x16\x03\x01" + struct.pack("!H", len(handshake)) + handshake
 
@@ -469,6 +514,9 @@ def test_sni_parsing_and_mismatch(harness, upstream, log):
     assert server_name(_client_hello("pypi.org")) == "pypi.org"
     assert server_name(b"\x16\x03\x01\x00") is None
     assert server_name(b"GET / HTTP/1.1") is None
+    hello = _client_hello("pypi.org", ("h2", "http/1.1"))
+    assert server_name(hello) == "pypi.org" and alpn_protocols(hello) == ["h2", "http/1.1"]
+    assert alpn_protocols(_client_hello("pypi.org")) is None
     h = harness([f"127.0.0.1:{upstream}"])
     h.raw(
         f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode(),
