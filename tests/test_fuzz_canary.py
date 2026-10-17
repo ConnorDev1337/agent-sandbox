@@ -7,7 +7,7 @@ from urllib.parse import quote
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from agent_sandbox.canary import CanaryMatcher, StreamScanner, generate
+from agent_sandbox.canary import MAX_HOLD, CanaryMatcher, StreamScanner, generate
 
 CANARIES = generate()
 MATCHER = CanaryMatcher(CANARIES)
@@ -112,7 +112,7 @@ def test_streams_are_released_whole_and_in_order(data, cuts):
         released += safe
         fed = end
         # Everything but the hold-back is released, and the hold-back is bounded.
-        assert len(released) >= fed - (MATCHER.span - 1) * 2 - 64 * 1024
+        assert len(released) >= fed - MAX_HOLD
         assert data.startswith(released)
     assert released + scanner.flush() == data
 
