@@ -78,26 +78,39 @@ docker_ready() {
     docker info >/dev/null 2>&1
 }
 
-register_runsc() {
-    log "registering runsc in this container's Docker daemon"
-    # The OCI seccomp profile is ignored by runsc unless --oci-seccomp is set.
-    /usr/local/bin/runsc install --runtime runsc -- --oci-seccomp --platform="$GVISOR_PLATFORM"
-    cat /etc/docker/daemon.json
-    if docker_ready; then
-        kill -HUP "$(pidof dockerd)"  # runtimes are reloadable
-    else
-        DOCKER_TLS_CERTDIR="" dockerd-entrypoint.sh dockerd >/var/log/dockerd.log 2>&1 &
-    fi
+runsc_ready() {
+    docker_ready && docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
+}
+
+wait_for() {
+    what="$1"
+    shift
     tries=0
-    until docker_ready && docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'; do
+    until "$@"; do
         tries=$((tries + 1))
         if [ "$tries" -gt 60 ]; then
-            echo "dockerd did not come up with the runsc runtime" >&2
+            echo "timed out waiting for $what" >&2
             tail -n 50 /var/log/dockerd.log >&2 || true
             exit 1
         fi
         sleep 1
     done
+}
+
+register_runsc() {
+    log "registering runsc in this container's Docker daemon"
+    # The OCI seccomp profile is ignored by runsc unless --oci-seccomp is set.
+    /usr/local/bin/runsc install --runtime runsc -- --oci-seccomp --platform="$GVISOR_PLATFORM"
+    cat /etc/docker/daemon.json
+    echo
+    if pidof dockerd >/dev/null; then
+        # Started by the image's entrypoint: wait for it, then reload its runtimes.
+        wait_for dockerd docker_ready
+        kill -HUP "$(pidof dockerd)"
+    else
+        DOCKER_TLS_CERTDIR="" dockerd-entrypoint.sh dockerd >/var/log/dockerd.log 2>&1 &
+    fi
+    wait_for "the runsc runtime" runsc_ready
     docker info --format 'docker {{.ServerVersion}}, kernel {{.KernelVersion}}, cgroup v{{.CgroupVersion}}'
 }
 
