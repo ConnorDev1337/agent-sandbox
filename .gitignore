@@ -5,6 +5,7 @@ build/
 dist/
 .venv/
 .pytest_cache/
+.hypothesis/
 .ruff_cache/
 .coverage
 coverage.xml
