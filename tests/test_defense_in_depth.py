@@ -159,7 +159,7 @@ def test_poisoned_description_hides_its_character_behind_an_escape():
     assert raw.isascii() and "\\u200b" in raw
     tools = json.loads(raw)["servers"]["ticket-helper"]["tools"]
     description = next(t["description"] for t in tools if t["name"] == "summarize_ticket")
-    assert "​" in description
+    assert chr(0x200B) in description  # decoded from the escape above
 
 
 @pytest.mark.parametrize(
