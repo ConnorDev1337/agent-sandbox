@@ -335,6 +335,14 @@ def test_connect_tunnel_scans_plaintext(harness, upstream, canaries, log):
     )
     assert b"hello from upstream" not in blocked
     assert read_jsonl(log.directory / "alerts.jsonl")[-1]["where"] == "tunnel data"
+    # Other protocols are relayed as a byte stream (here answered by the HTTP server).
+    relayed = h.raw(
+        f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\n\r\n".encode(),
+        read_after=b"SSH-2.0-client\r\n\r\n",
+    )
+    assert b"400" in relayed and b"agent-sandbox gateway" not in relayed
+    event = read_jsonl(log.directory / "events.jsonl")[-1]
+    assert event["kind"] == "egress.allowed" and "inspected" not in event
 
 
 def test_http_in_plaintext_tunnel_is_parsed(harness, keepalive_upstream, canaries, log):
