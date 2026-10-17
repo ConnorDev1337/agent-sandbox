@@ -59,6 +59,20 @@ test:
         coverage_format: cobertura
         path: coverage.xml
 
+libressl:
+  # The certificate tests against LibreSSL, which macOS ships as
+  # /usr/bin/openssl; Alpine's package installs it as /usr/bin/libressl, and
+  # the image has no other openssl, so every TLS test mints with LibreSSL.
+  stage: test
+  extends: .pip-cache
+  image: python:3.13-alpine@sha256:2d9aefe2fef018a7eb2c13064c89c71929800fd2e5dccdbf52ea5da5bb8d929a
+  variables:
+    OPENSSL: /usr/bin/libressl
+  script:
+    - apk add --no-cache libressl
+    - pip install -e ".[dev]"
+    - python -m pytest tests/test_tls_inspection.py -v
+
 compose-config:
   stage: test
   image: docker:29-cli
