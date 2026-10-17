@@ -639,11 +639,17 @@ def test_tripwire_detects_reads(tmp_path, canaries, log):
     assert wire.arm(), read_jsonl(log.directory / "events.jsonl")
     wire.start()
     paths[0].read_text(encoding="utf-8")
+    alerts = []
     for _ in range(50):
-        if (log.directory / "alerts.jsonl").exists():
+        # The alert file can exist before its first line is complete.
+        try:
+            alerts = read_jsonl(log.directory / "alerts.jsonl")
+        except ValueError:
+            alerts = []
+        if alerts:
             break
         time.sleep(0.1)
-    assert read_jsonl(log.directory / "alerts.jsonl")[0]["kind"] == "canary.file_access"
+    assert alerts and alerts[0]["kind"] == "canary.file_access"
 
 
 def test_alert_validation_and_webhook_failure(tmp_path):
