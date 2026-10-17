@@ -25,6 +25,11 @@ FORBIDDEN_CANDIDATES = ("DELETE", "PUT", "PATCH", "POST")
 SAMPLE_CONFIG = """\
 # agent-sandbox configuration (safe to commit: it contains no secrets).
 
+[sandbox]
+# Run the agent under gVisor's user-space kernel instead of the host kernel
+# (needs runsc registered with --oci-seccomp; check with: agent-sandbox doctor).
+# runtime = "runsc"
+
 [network]
 # Hosts the agent may reach through the gateway, in addition to the defaults
 # (PyPI, npm, GitHub). Use "*.example.com" for subdomains, "host:port" for ports,
