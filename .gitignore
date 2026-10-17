@@ -17,3 +17,6 @@ htmlcov/
 # Local demo workspace used for manual end-to-end runs
 .demo-workspace/
 .verify.log
+
+# Output of examples/defense-in-depth/demo.py (evidence, sandbox state)
+.demo-output/
