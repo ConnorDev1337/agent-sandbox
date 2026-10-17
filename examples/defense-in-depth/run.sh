@@ -22,6 +22,11 @@ if [ -z "$python" ]; then
 fi
 python="${python:-python3}"
 
-# Git Bash on Windows would otherwise rewrite container paths such as /workspace.
-export MSYS_NO_PATHCONV=1
-exec "$python" "$here/demo.py" "$@"
+script="$here/demo.py"
+if command -v cygpath >/dev/null 2>&1; then
+    # Git Bash on Windows: hand a native path to a Windows Python, and stop MSYS
+    # from rewriting other arguments (pass --out and the like as native paths).
+    script="$(cygpath -m "$script")"
+    export MSYS_NO_PATHCONV=1
+fi
+exec "$python" "$script" "$@"

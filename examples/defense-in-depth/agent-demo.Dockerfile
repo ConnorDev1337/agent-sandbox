@@ -8,6 +8,9 @@
 #
 # Build context: a directory containing tool-call-guard/ and mcp-security-scanner/.
 
+# Base agent image, built by the demo driver from agent-sandbox's agent.Dockerfile.
+ARG BASE_IMAGE=agent-sandbox-demo/agent-base:defense-in-depth
+
 # Wheels builder. Pinned to the same Python base image the gateway uses.
 FROM python:3.13-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641 AS wheels
 WORKDIR /build
@@ -16,7 +19,6 @@ COPY mcp-security-scanner /build/mcp-security-scanner
 RUN python -m pip wheel --no-deps -w /wheels \
         /build/tool-call-guard /build/mcp-security-scanner
 
-ARG BASE_IMAGE=agent-sandbox-demo/agent-base:defense-in-depth
 FROM ${BASE_IMAGE}
 
 # Install the two tools from the locally built wheels (no index, no network). The
