@@ -179,7 +179,8 @@ webhook = "https://hooks.slack.com/services/..."   # optional
 Allowlist entries are exact host names, `*.domain` for strict subdomains, or `host:port`. IP
 literals are only allowed when listed explicitly.
 
-An entry can also be a table that limits what may be sent to the host:
+An entry can also be a table that limits what may be sent to the host, or exempts it from TLS
+inspection:
 
 | Key | Meaning |
 |---|---|
@@ -200,7 +201,7 @@ The gateway can only enforce these rules on requests it can read: always for pla
 HTTPS only with `tls_inspect = true`. Without inspection, HTTPS tunnels to a restricted host are
 still allowed (the request inside is invisible), and `agent-sandbox up` prints a warning.
 
-`inspect = false` works the other way round: under `tls_inspect`, HTTPS to the matching
+`inspect = false` loosens instead of narrowing: under `tls_inspect`, HTTPS to the matching
 destinations is passed through uninspected. One such entry is enough, whatever other entries
 for the same host say, and a wildcard covers subdomains only, as in the allowlist. Since nothing
 inside a passthrough tunnel is visible, such an entry cannot have `methods` or `paths`, and it
