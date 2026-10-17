@@ -307,7 +307,8 @@ $ agent-sandbox alerts
 - `events.jsonl` also records each request relayed by an inspecting connection
   (`egress.request`: method, path without query, host), refusals by method or path rules
   (`egress.denied` with a `path`), failed upstream TLS verification (`egress.tls_error`) and
-  agent clients that rejected the sandbox CA (`tls.client_rejected`).
+  agent clients that rejected the sandbox CA (`tls.client_rejected`). The SHA-256 fingerprint
+  of the sandbox CA is logged at start-up (`tls.inspection_enabled`).
 - With `[alerts] webhook`, each alert is also POSTed as JSON (`{"text": ..., "alert": {...}}`,
   compatible with Slack incoming webhooks).
 - `agent-sandbox alerts --fail` exits 1 if there is a critical alert, for use in scripts.
