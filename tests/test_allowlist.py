@@ -15,6 +15,12 @@ from agent_sandbox.allowlist import Allowlist, normalize_host, parse_rule
         ("-x.example", None),
         ("", None),
         ("a" * 300 + ".com", None),
+        # Found by tests/test_fuzz_allowlist.py: the Kelvin sign lowercases to
+        # "k", and resolvers read names with a numeric last label as IPv4.
+        (chr(0x212A) + "ey.example", None),
+        ("127.1", None),
+        ("0x7f.1", None),
+        ("10.0.0.0x1", None),
     ],
 )
 def test_normalize_host(raw, expected):
@@ -41,7 +47,19 @@ def test_ip_literals_must_be_listed_explicitly():
 
 
 @pytest.mark.parametrize(
-    "entry", ["pypi.org:0", "pypi.org:http", "*.", "under_score..com", "x:1:2"]
+    "entry",
+    [
+        "pypi.org:0",
+        "pypi.org:http",
+        "*.",
+        "under_score..com",
+        "x:1:2",
+        # Found by tests/test_fuzz_allowlist.py: str.isdigit() and int() accept
+        # other digits than ASCII ones; a numeric suffix matches IPv4 addresses.
+        "pypi.org:" + chr(0x661),
+        "pypi.org:\xb2",
+        "*.0.1",
+    ],
 )
 def test_invalid_entries(entry):
     with pytest.raises(ValueError):
@@ -76,7 +94,16 @@ def test_method_and_path_rules():
 @pytest.mark.parametrize(
     "path",
     ["/a/%2e%2e/git-upload-pack", "/a%2Fb/git-upload-pack", "/a/../git-upload-pack",
-     "//x/git-upload-pack", "/a\\b/git-upload-pack", "/a/./git-upload-pack"],
+     "//x/git-upload-pack", "/a\\b/git-upload-pack", "/a/./git-upload-pack",
+     # Found by tests/test_fuzz_allowlist.py: what Tomcat (path parameters),
+     # Windows (trailing dots and spaces), IIS (%u), double-decoding, NUL
+     # truncating or lenient UTF-8 decoding servers turn into dot segments, and
+     # fragments or escaped "?" a decoding front end turns into delimiters.
+     "/a/..;/git-upload-pack", "/a/..;x/git-upload-pack", "/;/git-upload-pack",
+     "/a/..%20/git-upload-pack", "/a/.. ./git-upload-pack", "/a/%u002e%u002e/git-upload-pack",
+     "/a/%252e%252e/git-upload-pack", "/a/..%00/git-upload-pack",
+     "/a/%c0%ae%c0%ae/git-upload-pack", "/a/\xc0\xae\xc0\xae/git-upload-pack",
+     "/x#/a/git-upload-pack", "/x%23/a/git-upload-pack", "/x%3f/a/git-upload-pack"],
 )  # fmt: skip
 def test_ambiguous_paths_never_match_path_rules(path):
     assert not Allowlist(GITHUB_READ_ONLY).permits("github.com", 443, "POST", path)

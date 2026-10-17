@@ -26,19 +26,33 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
+from urllib.parse import unquote_to_bytes
 
 DEFAULT_PORTS = (80, 443)
 RULE_KEYS = frozenset({"host", "methods", "paths", "inspect"})
 _LABEL = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$")
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 _METHOD = re.compile(r"^[A-Z][A-Z0-9_-]{0,31}$")
-# Paths that servers may normalize differently from a plain glob match.
-_AMBIGUOUS_PATH = re.compile(r"%2[ef]|%5c|\\|//|/\.\.?(/|$)", re.IGNORECASE)
+_PORT = re.compile(r"[0-9]{1,5}")
+# Paths that servers may normalize differently from a plain glob match: escaped
+# dots, delimiters or percent signs (some servers decode twice), IIS "%u"
+# escapes, backslashes, fragments, whitespace, control characters and "//".
+_AMBIGUOUS_PATH = re.compile(r"%(?:00|2[35ef]|3[bf]|5c)|%u|[\x00-\x20\x7f\\#]|//", re.IGNORECASE)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 AllowEntry = str | Mapping[str, Any]
 
 
 def normalize_host(host: str) -> str | None:
-    """Lowercase hostname without trailing dot, or ``None`` if it is not a valid name."""
+    """Lowercase hostname without trailing dot, or ``None`` if it is not a valid name.
+
+    Names must be ASCII (IDNA names in punycode), so that no Unicode character
+    lowercases to an ASCII one, and must not end with a numeric label: no
+    top-level domain is numeric, and resolvers read ``127.1`` or ``0x7f.1`` as
+    IPv4 addresses.
+    """
+    if not host.isascii():
+        return None
     host = host.strip().lower().rstrip(".")
     if not host or len(host) > 253:
         return None
@@ -50,6 +64,8 @@ def normalize_host(host: str) -> str | None:
         pass
     labels = host.split(".")
     if len(labels) < 2 or not all(_LABEL.match(label) for label in labels):
+        return None
+    if _NUMERIC_LABEL.fullmatch(labels[-1]):
         return None
     return host
 
@@ -97,7 +113,7 @@ class AllowRule:
             return False
         if self.paths is None:
             return True
-        if _AMBIGUOUS_PATH.search(path):
+        if ambiguous_path(path):
             return False
         return any(fnmatchcase(path, pattern) for pattern in self.paths)
 
@@ -112,12 +128,29 @@ class AllowRule:
         return text
 
 
+def ambiguous_path(path: str) -> bool:
+    """Return True if servers could route ``path`` elsewhere than a glob match suggests."""
+    if not path.isascii() or _AMBIGUOUS_PATH.search(path):
+        return True
+    try:
+        decoded = unquote_to_bytes(path).decode("utf-8")  # Refuses overlong "/" and "."
+    except UnicodeDecodeError:
+        return True
+    if _CONTROL.search(decoded):
+        return True
+    # Dot segments, also with path parameters (Tomcat) or trailing dots and
+    # spaces (Windows): "/a/..;x/b" and "/a/..%20/b" are "/b" to some servers.
+    return any(
+        segment and not segment.split(";", 1)[0].rstrip(". ") for segment in decoded.split("/")
+    )
+
+
 def _parse_host(entry: str, default_ports: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
     text = entry.strip().lower()
     ports = default_ports
     if text.count(":") == 1 and not text.startswith("["):
         text, _, port_text = text.partition(":")
-        if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+        if not _PORT.fullmatch(port_text) or not 0 < int(port_text) < 65536:
             raise ValueError(f"invalid port in allowlist entry {entry!r}")
         ports = (int(port_text),)
     wildcard = text.startswith("*.")

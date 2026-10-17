@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import re
 import socket
 import ssl
 from collections.abc import Awaitable, Callable
@@ -55,6 +56,7 @@ from .tls import (
 __all__ = ["MAX_HEAD", "Proxy", "ProxyError", "Request", "parse_head", "serve", "split_host_port"]
 
 CHUNK = 64 * 1024
+_PORT = re.compile(r"[0-9]{1,5}")
 SCAN_OVERLAP = 4096  # bytes kept between chunks so split values are still found
 # What to do with a request body that cannot be decoded for scanning.
 UNDECODABLE_POLICIES = ("block", "allow")
@@ -99,14 +101,18 @@ def is_public(address: str) -> bool:
 
 
 def split_host_port(authority: str, default_port: int) -> tuple[str, int]:
-    host, port = authority, default_port
+    """Split ``host[:port]`` (IPv6 in brackets); raise ValueError unless both are valid."""
+    host, port_text = authority, None
     if authority.startswith("["):
-        host, _, rest = authority[1:].partition("]")
-        if rest.startswith(":"):
-            port = int(rest[1:])
+        host, bracket, rest = authority[1:].partition("]")
+        if not bracket or rest[:1] not in ("", ":"):
+            raise ValueError(authority)
+        port_text = rest[1:] if rest else None
     elif authority.count(":") == 1:
         host, _, port_text = authority.partition(":")
-        port = int(port_text)
+    if port_text is not None and not _PORT.fullmatch(port_text):
+        raise ValueError(authority)
+    port = default_port if port_text is None else int(port_text)
     normalized = normalize_host(host)
     if normalized is None or not 0 < port < 65536:
         raise ValueError(authority)
