@@ -108,6 +108,14 @@ def _wrap(text: str, width: int, sep: str = "\r\n") -> str:
             lambda s, p: p.decode() + "".join(f"%{b:02x}" for b in s.encode()[:20]) + s[20:],
             "plain (percent-decoded)",
         ),
+        # Found by tests/test_fuzz_canary.py: soft line breaks with the trailing
+        # whitespace decoders ignore, and percent-encoded ones (a form field
+        # holding a quoted-printable value) were left in the searched data.
+        (lambda s, p: _wrap(p.decode() + s, 9, "= \t\r\n"), "plain"),
+        (
+            lambda s, p: "".join(f"%{b:02X}" for b in _wrap(p.decode() + s, 9, "=\r\n").encode()),
+            "plain (percent-decoded)",
+        ),
     ],
     ids=[
         "b64-lf",
@@ -117,6 +125,8 @@ def _wrap(text: str, width: int, sep: str = "\r\n") -> str:
         "url-keep-slash",
         "url-all",
         "url-mixed",
+        "quoted-printable-trailing-space",
+        "url-quoted-printable",
     ],
 )
 def test_detects_wrapped_and_partially_encoded_secrets(canaries, matcher, encode, label):
