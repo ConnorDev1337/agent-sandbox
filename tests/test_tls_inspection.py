@@ -259,6 +259,8 @@ def test_openssl_failures_are_reported(tmp_path, monkeypatch, sandbox_ca, openss
     broken.ca = certs.CertificateAuthority(tmp_path / "missing", openssl)
     with pytest.raises(certs.CertificateError, match="cannot mint"):
         asyncio.run(broken.context_for("x.example"))
+    monkeypatch.setattr(certs.shutil, "which", lambda name: f"/opt/bin/{name}")
+    assert certs.find_openssl() == "/opt/bin/openssl"
     monkeypatch.setattr(certs.shutil, "which", lambda name: None)
     with pytest.raises(certs.CertificateError, match="required"):
         certs.find_openssl()
