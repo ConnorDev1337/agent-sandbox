@@ -102,8 +102,14 @@ def _args(**values):
 
 
 def test_tls_checks_are_skipped_without_inspection():
-    for check in (selftest._tls_intercepted, selftest._ca_bundle, selftest._https_exfiltration):
-        ok, detail = check(_args())
+    checks = (
+        selftest._tls_intercepted,
+        selftest._tls_passthrough,
+        selftest._ca_bundle,
+        selftest._https_exfiltration,
+    )
+    for check in checks:
+        ok, detail = check(_args(passthrough_host="registry.npmjs.org"))
         assert ok is None and "TLS inspection is off" in detail
     assert selftest._forbidden_method(_args())[0] is None
 
@@ -132,8 +138,8 @@ def test_tls_checks_with_inspection(tmp_path, monkeypatch):
 
 
 def test_tls_passthrough_check(tmp_path, monkeypatch):
-    assert selftest._tls_passthrough(_args(passthrough_host="repo.example"))[0] is None
-    assert selftest._tls_passthrough(_args(tls_inspect=True))[0] is None
+    ok, detail = selftest._tls_passthrough(_args(tls_inspect=True))
+    assert ok is None and "no inspect = false entry" in detail
     seen = []
 
     def issuer(name):
