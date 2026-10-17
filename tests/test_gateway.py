@@ -602,7 +602,7 @@ def _hello_records(extensions: bytes, suites: int = 1, size: int = 16384) -> byt
 @pytest.mark.parametrize(
     "extensions",
     [
-        # Found by tests/test_fuzz_tls.py: the gateway read the first name or
+        # Checked by tests/test_fuzz_tls.py: the gateway read the first name or
         # extension, a server may read the other one.
         _names(b"pypi.org", b"evil.example"),
         _names(b"pypi.org") + _names(b"evil.example"),
@@ -621,7 +621,7 @@ def test_ambiguous_hellos_are_malformed(extensions):
 @pytest.mark.parametrize(
     "hello",
     [
-        # Found by tests/test_fuzz_tls.py: a ClientHello over MAX_HELLO bytes, or
+        # Checked by tests/test_fuzz_tls.py: a ClientHello over MAX_HELLO bytes, or
         # with two names, was relayed without a server name check (OpenSSL
         # servers accept ClientHellos up to 128 KiB).
         _hello_records(_extension(21, b"\0" * 50000) + _names(b"evil.example"), suites=10000),
