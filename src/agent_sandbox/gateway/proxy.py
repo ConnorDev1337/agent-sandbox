@@ -8,7 +8,9 @@ non-TLS tunnels, TLS SNI) is scanned for canary values.
 Requests the gateway can parse (plain HTTP, plaintext tunnels to hosts with
 method or path rules and, with TLS inspection, every HTTPS tunnel) are
 relayed one by one so the allowlist rules and the ``Host`` header can be
-enforced on each of them.
+enforced on each of them. Their bodies are also scanned decoded when they
+carry a ``Content-Encoding``; a body that cannot be decoded is refused or
+forwarded scanned as sent, depending on the ``undecodable_bodies`` policy.
 """
 
 from __future__ import annotations
@@ -23,8 +25,9 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from ..allowlist import Allowlist, normalize_host
-from ..canary import CanaryHit, CanaryMatcher, StreamScanner
+from ..canary import CanaryHit, CanaryMatcher
 from .alerts import EventLog
+from .decoding import MAX_DECODED, BodyScanner, DecodeError, content_codings
 from .http1 import (
     MAX_HEAD,
     BufferedReader,
@@ -42,6 +45,8 @@ __all__ = ["MAX_HEAD", "Proxy", "ProxyError", "Request", "parse_head", "serve", 
 
 CHUNK = 64 * 1024
 SCAN_OVERLAP = 4096  # bytes kept between chunks so split values are still found
+# What to do with a request body that cannot be decoded for scanning.
+UNDECODABLE_POLICIES = ("block", "allow")
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -109,8 +114,12 @@ class Proxy:
         idle_timeout: float = 300.0,
         tls_issuer: LeafIssuer | None = None,
         upstream_tls: ssl.SSLContext | None = None,
+        undecodable_bodies: str = "block",
+        max_decoded_body: int = MAX_DECODED,
     ) -> None:
         """Create a proxy; with ``tls_issuer`` set, HTTPS tunnels are inspected."""
+        if undecodable_bodies not in UNDECODABLE_POLICIES:
+            raise ValueError(f"unknown undecodable_bodies policy {undecodable_bodies!r}")
         self.allowlist = allowlist
         self.matcher = matcher
         self.log = log
@@ -119,6 +128,8 @@ class Proxy:
         self.idle_timeout = idle_timeout
         self.tls_issuer = tls_issuer
         self.upstream_tls = upstream_tls
+        self.undecodable_bodies = undecodable_bodies
+        self.max_decoded_body = max_decoded_body
         if tls_issuer is not None and upstream_tls is None:
             self.upstream_tls = ssl.create_default_context()
 
@@ -209,6 +220,53 @@ class Proxy:
                 client=client,
             )
             raise ProxyError(403, f"blocked: {method} {path[:100]} is not allowed for {host}")
+
+    def _undecodable(
+        self, error: DecodeError, encoding: str, host: str, client: str, *, tls: bool
+    ) -> None:
+        """Apply the policy to a body that cannot be decoded for scanning."""
+        fields = {
+            "host": host,
+            "encoding": encoding[:100],
+            "reason": error.reason,
+            "tls": tls,
+            "client": client,
+        }
+        if self.undecodable_bodies == "allow":
+            self.log.event("egress.undecodable_body", action="allowed", **fields)
+            return
+        self.log.alert(
+            "egress.undecodable_body",
+            "warning",
+            f"request body to {host} cannot be decoded for scanning ({error.reason})",
+            action="blocked",
+            **fields,
+        )
+        raise ProxyError(error.status, f"blocked: request body cannot be scanned ({error.reason})")
+
+    def _body_scanner(self, request: Request, host: str, client: str, *, tls: bool) -> BodyScanner:
+        """Return a scanner for the body of ``request``, decoding its content codings."""
+        codings = content_codings(request.header_values("content-encoding"))
+        if not codings or body_length(request) == 0:
+            return BodyScanner(self.matcher)
+        try:
+            return BodyScanner(self.matcher, codings, max_decoded=self.max_decoded_body)
+        except DecodeError as exc:
+            self._undecodable(exc, ", ".join(codings), host, client, tls=tls)
+            return BodyScanner(self.matcher)
+
+    def _scan_body(
+        self, scanner: BodyScanner, data: bytes | None, host: str, client: str, *, tls: bool
+    ) -> bytes:
+        """Scan the next piece of a body (``None`` at its end); return the bytes proven clean."""
+        try:
+            safe, hits = scanner.finish() if data is None else scanner.feed(data)
+        except DecodeError as exc:
+            self._undecodable(exc, scanner.encoding, host, client, tls=tls)
+            return scanner.abandon()
+        if hits:
+            self._exfiltration(hits, client, where="request body", host=host, tls=tls)
+        return safe
 
     def _check_authority(
         self, authority: str, host: str, port: int, client: str, *, tls: bool
@@ -554,6 +612,7 @@ class Proxy:
             if request.header("upgrade") is not None:
                 raise ProxyError(501, "protocol upgrades are not supported by the gateway")
             length = body_length(request)
+            scanner = self._body_scanner(request, host, client, tls=tls)
             if (request.header("expect") or "").lower() == "100-continue":
                 # The head is held until the body is scanned, so the server cannot
                 # send the interim response; the gateway does, and drops the header.
@@ -561,7 +620,7 @@ class Proxy:
                 client_writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
                 await client_writer.drain()
             await self._relay_body(
-                source, upstream, serialize_head(request), length, host, client, tls=tls
+                source, upstream, serialize_head(request), length, scanner, host, client, tls=tls
             )
             self.log.event(
                 "egress.request",
@@ -579,6 +638,7 @@ class Proxy:
         sink: asyncio.StreamWriter,
         head: bytes,
         length: int | None,
+        scanner: BodyScanner,
         host: str,
         client: str,
         *,
@@ -592,7 +652,6 @@ class Proxy:
         bytes that a canary is detected before any part of it leaves, and the
         server is left with a truncated request.
         """
-        scanner = StreamScanner(self.matcher)
         chunked = length is None
         held: list[bytes] | None = [head]
         held_size = 0
@@ -613,9 +672,7 @@ class Proxy:
             data = await asyncio.wait_for(source.read(min(size, CHUNK)), self.idle_timeout)
             if not data:
                 raise ProxyError(400, "request body ended early")
-            safe, hits = scanner.feed(data)
-            if hits:
-                self._exfiltration(hits, client, where="request body", host=host, tls=tls)
+            safe = self._scan_body(scanner, data, host, client, tls=tls)
             if safe:
                 await emit(chunk(safe) if chunked else safe)
             return len(data)
@@ -623,7 +680,7 @@ class Proxy:
         if length is not None:
             while length:
                 length -= await take(length)
-            await emit(scanner.flush())
+            await emit(self._scan_body(scanner, None, host, client, tls=tls))
         else:
             await self._relay_chunks(source, scanner, take, emit, host, client, tls=tls)
         if held is not None:
@@ -633,7 +690,7 @@ class Proxy:
     async def _relay_chunks(
         self,
         source: BufferedReader,
-        scanner: StreamScanner,
+        scanner: BodyScanner,
         take: Callable[[int], Awaitable[int]],
         emit: Callable[[bytes], Awaitable[None]],
         host: str,
@@ -653,7 +710,7 @@ class Proxy:
                 # Trailers are scanned but not forwarded: they are rarely needed and
                 # would have to be validated like headers.
                 self._check_canaries(trailers, client, where="request body", host=host, tls=tls)
-                tail = scanner.flush()
+                tail = self._scan_body(scanner, None, host, client, tls=tls)
                 await emit((chunk(tail) if tail else b"") + b"0\r\n\r\n")
                 return
             while size:
@@ -702,11 +759,13 @@ class Proxy:
             self._check_authority(host_header, host, port, client, tls=False)
         path = url.path or "/"
         self._check_request(host, port, request.method, path, client)
+        scanner = self._body_scanner(request, host, client, tls=False)
         if (request.header("expect") or "").lower() == "100-continue":
             writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
             await writer.drain()
         body = await self._read_body(request, reader)
-        self._check_canaries(body, client, where="request body", host=host)
+        for data in (body, None):  # The body is forwarded whole, once fully scanned
+            self._scan_body(scanner, data, host, client, tls=False)
 
         if url.query:
             path += "?" + url.query

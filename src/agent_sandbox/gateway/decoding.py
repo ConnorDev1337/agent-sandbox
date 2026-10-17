@@ -186,13 +186,14 @@ class BodyScanner:
         tail = self._raw.flush()
         if not self._layers:
             return tail, []
+        self._held += tail  # Kept for abandon() if decoding fails below
+        self._held_end += len(tail)
         if self._fed:  # An empty body has nothing to decode.
             hits = self._scan(self._pipeline(0, [], final=True))
             if hits:
                 return b"", hits
         self._decoded.flush()
-        data = bytes(self._held) + tail
-        self._held = bytearray()
+        data, self._held = bytes(self._held), bytearray()
         return data, []
 
     def abandon(self) -> bytes:

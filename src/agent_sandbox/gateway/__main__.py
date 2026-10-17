@@ -12,6 +12,7 @@ from ..allowlist import Allowlist
 from ..canary import CanaryMatcher, load_registry
 from . import certs, dns, proxy
 from .alerts import EventLog
+from .decoding import MAX_DECODED
 from .tripwire import Tripwire, seed
 
 
@@ -60,6 +61,10 @@ async def _run(args: argparse.Namespace) -> None:
             max_body=config.get("max_body", 10 * 1024 * 1024),
             tls_issuer=issuer,
             upstream_tls=certs.upstream_context() if issuer else None,
+            undecodable_bodies=config.get(
+                "undecodable_bodies", "block" if config.get("tls_inspect") else "allow"
+            ),
+            max_decoded_body=config.get("max_decoded_body", MAX_DECODED),
         ),
         args.listen,
         args.proxy_port,

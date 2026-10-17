@@ -75,7 +75,22 @@ allow = [
     }
     settings = config.gateway_settings()
     assert settings["tls_inspect"] is True and settings["allow"][-2]["methods"] == ["GET", "HEAD"]
+    assert settings["undecodable_bodies"] == "block"  # the default under inspection
     assert json.loads(json.dumps(settings)) == settings
+
+
+@pytest.mark.parametrize(
+    ("text", "policy"),
+    [
+        ("", "allow"),
+        ("[network]\ntls_inspect = true\n", "block"),
+        ('[network]\nundecodable_bodies = "block"\n', "block"),
+        ('[network]\ntls_inspect = true\nundecodable_bodies = "allow"\n', "allow"),
+    ],
+)
+def test_undecodable_bodies_policy(workspace, text, policy):
+    write_config(workspace, text)
+    assert load(workspace).gateway_settings()["undecodable_bodies"] == policy
 
 
 def test_rules_without_inspection_warn(workspace):
@@ -91,6 +106,7 @@ def test_rules_without_inspection_warn(workspace):
     [
         ("[nope]\n", "unknown section"),
         ('[network]\ntls_inspect = "yes"\n', "true or false"),
+        ('[network]\nundecodable_bodies = "drop"\n', '"block" or "allow"'),
         ("[network]\nallow = [1]\n", "strings or tables"),
         (
             '[network]\nallow = [{ host = "x.example", methods = ["BAD METHOD"] }]\n',

@@ -6,6 +6,7 @@ image; the tests are skipped where it is not installed.
 
 import asyncio
 import contextlib
+import gzip
 import shutil
 import socket
 import ssl
@@ -257,6 +258,21 @@ def test_canary_in_https_body_is_blocked(inspecting, tls_upstream, sandbox_ca, c
     assert alert["kind"] == "canary.exfiltration" and alert["tls"] is True
     assert alert["where"] == "request body" and "decrypted TLS" in alert["message"]
     assert secret not in (log.directory / "events.jsonl").read_text(encoding="utf-8")
+
+
+def test_canary_in_gzip_https_body_is_blocked(inspecting, tls_upstream, sandbox_ca, canaries, log):
+    target = f"127.0.0.1:{tls_upstream}"
+    secret = next(c for c in canaries if c.kind == "github").secrets[0]
+    body = gzip.compress(f'{{"token": "{secret}"}}'.encode())
+    payload = (
+        f"POST /api HTTP/1.1\r\nHost: {target}\r\nContent-Encoding: gzip\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+    response, _ = https(inspecting().port, target, payload, str(sandbox_ca.cert))
+    assert response.startswith(b"HTTP/1.1 403") and b"canary" in response
+    assert TLSUpstream.received == []
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["tls"] is True and alert["encoding"] == "plain in gzip"
 
 
 def test_method_rules_apply_inside_tls(inspecting, tls_upstream, sandbox_ca, log):
