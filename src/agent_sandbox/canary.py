@@ -30,6 +30,7 @@ MIN_NEEDLE = 12  # shorter encoded fragments would cause false positives
 # a value wrapped over several lines is then found like an unwrapped one.
 _WHITESPACE = b" \t\r\n\x0b\x0c"
 _SOFT_BREAK = re.compile(rb"=\r?\n")  # quoted-printable soft line break
+_ESCAPE = re.compile(rb"%[0-9a-f]{2}")  # in lowercased data
 SPAN = 3  # a match may span up to SPAN times its length (percent-encoding)
 
 _ALNUM = string.ascii_letters + string.digits
@@ -233,8 +234,7 @@ class CanaryMatcher:
         # Bytes a match can span in the data before normalization.
         self.span = SPAN * self.longest
 
-    @staticmethod
-    def _views(data: bytes) -> list[tuple[bytes, str]]:
+    def _views(self, data: bytes) -> list[tuple[bytes, str]]:
         """Return normalized forms of ``data`` to search, with a label for each."""
         view = data.lower()
         if b"=\n" in view or b"=\r\n" in view:
@@ -242,8 +242,21 @@ class CanaryMatcher:
         view = view.translate(None, _WHITESPACE)
         views = [(view, "")]
         if b"%" in view:
-            decoded = unquote_to_bytes(view).lower().translate(None, _WHITESPACE)
-            views.append((decoded, " (percent-decoded)"))
+            # Only the surroundings of escapes can decode to something new, so
+            # binary data with the odd "%" costs little to decode.
+            parts: list[bytes] = []
+            start = end = -1
+            for escape in _ESCAPE.finditer(view):
+                low, high = max(escape.start() - self.span, 0), escape.end() + self.span
+                if low > end:
+                    if end >= 0:
+                        parts.append(view[start:end])
+                    start = low
+                end = high
+            if end >= 0:
+                parts.append(view[start:end])
+                decoded = b"\0".join(unquote_to_bytes(part) for part in parts)
+                views.append((decoded.lower().translate(None, _WHITESPACE), " (percent-decoded)"))
         return views
 
     def scan(self, data: bytes | str) -> list[CanaryHit]:

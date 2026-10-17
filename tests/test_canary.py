@@ -99,7 +99,7 @@ def _wrap(text: str, width: int, sep: str = "\r\n") -> str:
         (lambda s, p: _wrap(base64.b64encode(p + s.encode()).decode(), 76), "base64"),
         (lambda s, p: " ".join(f"{b:02x}" for b in p + s.encode()), "hex"),
         (lambda s, p: _wrap(p.decode() + s, 9, "=\r\n"), "plain"),  # quoted-printable
-        (lambda s, p: p.decode() + quote(s, safe="/"), "url|plain (percent-decoded)"),
+        (lambda s, p: p.decode() + quote(s, safe="/"), "plain|url|plain (percent-decoded)"),
         (
             lambda s, p: p.decode() + "".join(f"%{b:02X}" for b in s.encode()),
             "plain (percent-decoded)",
@@ -124,6 +124,15 @@ def test_detects_wrapped_and_partially_encoded_secrets(canaries, matcher, encode
     for prefix in (b"", b"k", b"key=", b"aws_secret_access_key = "):
         (hit,) = matcher.scan(f"part\r\n\r\n{encode(secret, prefix)}\r\n--boundary--")
         assert hit.kind == "aws" and hit.encoding in label.split("|")
+
+
+def test_percent_decoding_only_around_escapes(canaries, matcher):
+    secret = _secret(canaries, "github")
+    mixed = "".join(f"%{ord(c):02x}" for c in secret[:6]) + secret[6:]
+    noise = "%zz %41" + "x" * 2000
+    (hit,) = matcher.scan(f"{noise}{mixed}{noise}")
+    assert hit.encoding == "plain (percent-decoded)"
+    assert matcher.scan(noise + "%2f" + "y" * 2000 + "%25") == []
 
 
 def test_multipart_upload_of_a_canary_file_is_detected(canaries, matcher):
