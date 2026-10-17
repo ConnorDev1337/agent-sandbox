@@ -283,6 +283,7 @@ def cmd_config(config: SandboxConfig, _args: argparse.Namespace) -> int:
         "allow": list(config.allow),
         "default_ports": list(config.default_ports),
         "tls_inspect": config.tls_inspect,
+        "undecodable_bodies": config.undecodable_bodies,
         "subnet": config.subnet,
         "gateway_ip": config.gateway_ip,
         "agent_ip": config.agent_ip,

@@ -9,6 +9,7 @@ from agent_sandbox.gateway.http1 import (
     chunk,
     chunk_size,
     parse_head,
+    request_start,
     serialize_head,
 )
 
@@ -126,3 +127,20 @@ def test_buffered_reader_limits_and_partial_reads():
         assert info.value.partial == b"abc"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (b"GET / HTTP/1.1", True),
+        (b"M-SEARCH * HTTP/1.1", True),
+        (b"DEL", None),
+        (b"", False),
+        (b"SSH-2.0-OpenSSH_9.6\r\n", False),
+        (b"SSH-2.0-OpenSSH_9.6", None),
+        (b"\x16\x03\x01", False),
+        (b"X" * 30, False),
+    ],
+)
+def test_request_start(data, expected):
+    assert request_start(data) is expected
