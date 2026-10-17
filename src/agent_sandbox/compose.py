@@ -89,7 +89,8 @@ def build(config: SandboxConfig) -> dict[str, Any]:
         "image": config.gateway_image,
         "build": {"context": str(PACKAGE_DIR), "dockerfile": "docker/gateway.Dockerfile"},
         # Always runc, whatever the daemon's default: under gVisor, inotify does not
-        # see the agent opening the canary files, so the tripwire would go blind.
+        # see the agent opening the canary files (the tripwire would go blind) and
+        # Docker's embedded DNS server is out of reach (no name would resolve).
         "runtime": GATEWAY_RUNTIME,
         # Seeding the agent's home needs CHOWN/FOWNER/DAC_OVERRIDE; port 53 needs
         # NET_BIND_SERVICE. Nothing else.
