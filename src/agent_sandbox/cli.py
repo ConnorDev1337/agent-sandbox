@@ -27,8 +27,13 @@ SAMPLE_CONFIG = """\
 
 [network]
 # Hosts the agent may reach through the gateway, in addition to the defaults
-# (PyPI, npm, GitHub). Use "*.example.com" for subdomains, "host:port" for ports.
+# (PyPI, npm, GitHub). Use "*.example.com" for subdomains, "host:port" for ports,
+# and tables to limit methods and paths, e.g.
+# { host = "github.com", methods = ["GET", "HEAD"] }
 allow = []
+# Decrypt HTTPS with a per-sandbox CA so canaries in request bodies are caught
+# and method rules apply to HTTPS too (breaks clients that pin certificates).
+# tls_inspect = true
 
 [resources]
 cpus = 2
