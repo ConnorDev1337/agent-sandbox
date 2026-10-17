@@ -1,0 +1,149 @@
+#!/bin/sh
+# End-to-end self-test under gVisor, inside a privileged docker:dind container.
+#
+# Installs a pinned gVisor release (SHA-512 checked against the published file
+# and against the value pinned below), registers it as the "runsc" runtime of
+# this container's own Docker daemon with --oci-seccomp, and runs
+# `agent-sandbox verify --build` for every runtime in $RUNTIMES and every
+# TLS inspection mode in $TLS_MODES. The CLI runs next to the daemon, in the
+# same container, so the bind mounts of the generated Compose file resolve.
+#
+# Never run this on a host whose Docker daemon you care about: it rewrites
+# /etc/docker/daemon.json and reloads dockerd.
+#
+# Usage: sh scripts/e2e-dind.sh [SOURCE_DIR]    (default: the current directory)
+set -eu
+
+SOURCE_DIR="$(cd "${1:-.}" && pwd)"
+GVISOR_VERSION="${GVISOR_VERSION:-20260928.0}"
+GVISOR_CACHE="${GVISOR_CACHE:-/var/cache/gvisor}"
+RUNTIMES="${RUNTIMES-runsc runc}"
+TLS_MODES="${TLS_MODES-false true}"
+WORK_DIR="${WORK_DIR:-/tmp/agent-sandbox-e2e}"
+
+# SHA-512 of gvisor.tar.zstd for GVISOR_VERSION, per architecture.
+case "$(uname -m)" in
+    x86_64)
+        ARCH=x86_64
+        GVISOR_SHA512=4ce35ca83aef7f96b06cde668e0b23aa98b05aa1829508e974196c2a1e02786c95f5bf79315fd7ddcfd88fe7a00f083ed8053e25eff7673d28d5256440caae8b
+        ;;
+    aarch64)
+        ARCH=aarch64
+        GVISOR_SHA512=31519c2c8476c6eb24f51aa1378e555b4e86883dc1c8d81fb82df1af1900f38b10149affaa05bcc2418e57989bd04a33603a10ac73fee92e0fe20aef44e402e3
+        ;;
+    *)
+        echo "unsupported architecture: $(uname -m)" >&2
+        exit 2
+        ;;
+esac
+
+log() {
+    printf '\n=== %s\n' "$*"
+}
+
+install_packages() {
+    log "installing packages"
+    apk add --no-cache python3 py3-pip tar zstd >/dev/null
+}
+
+install_gvisor() {
+    url="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_VERSION}/${ARCH}"
+    dir="${GVISOR_CACHE}/${GVISOR_VERSION}/${ARCH}"
+    log "installing gVisor ${GVISOR_VERSION} (${ARCH})"
+    mkdir -p "$dir"
+    if [ ! -s "$dir/gvisor.tar.zstd" ]; then
+        wget -q -O "$dir/gvisor.tar.zstd.part" "$url/gvisor.tar.zstd"
+        mv "$dir/gvisor.tar.zstd.part" "$dir/gvisor.tar.zstd"
+    fi
+    wget -q -O "$dir/gvisor.tar.zstd.sha512" "$url/gvisor.tar.zstd.sha512"
+    published="$(cut -d' ' -f1 "$dir/gvisor.tar.zstd.sha512")"
+    if [ "$published" != "$GVISOR_SHA512" ]; then
+        echo "published SHA-512 $published differs from the pinned $GVISOR_SHA512" >&2
+        exit 1
+    fi
+    (cd "$dir" && sha512sum -c gvisor.tar.zstd.sha512)
+    tar --zstd -xf "$dir/gvisor.tar.zstd" -C /usr/local/bin
+    /usr/local/bin/runsc --version
+}
+
+docker_ready() {
+    docker info >/dev/null 2>&1
+}
+
+register_runsc() {
+    log "registering runsc in this container's Docker daemon"
+    # The OCI seccomp profile is ignored by runsc unless --oci-seccomp is set.
+    /usr/local/bin/runsc install --runtime runsc -- --oci-seccomp
+    cat /etc/docker/daemon.json
+    if docker_ready; then
+        kill -HUP "$(pidof dockerd)"  # runtimes are reloadable
+    else
+        DOCKER_TLS_CERTDIR="" dockerd-entrypoint.sh dockerd >/var/log/dockerd.log 2>&1 &
+    fi
+    tries=0
+    until docker_ready && docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'; do
+        tries=$((tries + 1))
+        if [ "$tries" -gt 60 ]; then
+            echo "dockerd did not come up with the runsc runtime" >&2
+            tail -n 50 /var/log/dockerd.log >&2 || true
+            exit 1
+        fi
+        sleep 1
+    done
+    docker info --format 'docker {{.ServerVersion}}, kernel {{.KernelVersion}}, cgroup v{{.CgroupVersion}}'
+}
+
+install_cli() {
+    log "installing agent-sandbox from ${SOURCE_DIR}"
+    rm -rf "$WORK_DIR/src"
+    mkdir -p "$WORK_DIR"
+    cp -R "$SOURCE_DIR" "$WORK_DIR/src"
+    python3 -m pip install --quiet --break-system-packages --no-cache-dir "$WORK_DIR/src"
+}
+
+verify() {
+    runtime="$1"
+    tls="$2"
+    workspace="$WORK_DIR/ws-$runtime-tls-$tls"
+    log "verify: runtime=$runtime tls_inspect=$tls"
+    rm -rf "$workspace"
+    mkdir -p "$workspace"
+    git -C "$workspace" init -q
+    cat >"$workspace/.agent-sandbox.toml" <<EOF
+[sandbox]
+runtime = "$runtime"
+
+[network]
+tls_inspect = $tls
+allow = [{ host = "github.com", methods = ["GET", "HEAD"] }]
+EOF
+    status=0
+    agent-sandbox -w "$workspace" verify --build || status=$?
+    if [ "$status" -ne 0 ]; then
+        agent-sandbox -w "$workspace" alerts --events -n 200 || true
+        project="$(agent-sandbox -w "$workspace" config | python3 -c \
+            'import json, sys; print(json.load(sys.stdin)["project"])')"
+        docker compose -p "$project" logs --no-color --tail 100 || true
+    fi
+    agent-sandbox -w "$workspace" down --volumes || true
+    RESULTS="${RESULTS}runtime=$runtime tls_inspect=$tls exit=$status
+"
+    [ "$status" -eq 0 ] || FAILED=1
+}
+
+install_packages
+install_gvisor
+register_runsc
+install_cli
+
+RESULTS=""
+FAILED=0
+for runtime in $RUNTIMES; do
+    for tls in $TLS_MODES; do
+        verify "$runtime" "$tls"
+    done
+done
+
+log "summary"
+printf '%s' "$RESULTS"
+exit "$FAILED"
