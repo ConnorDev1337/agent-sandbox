@@ -15,6 +15,7 @@ PACKAGE_DIR = Path(__file__).parent
 SECCOMP_PROFILE = PACKAGE_DIR / "docker" / "seccomp" / "agent.json"
 PROXY_PORT = 3128
 AGENT_HOME = "/home/agent"
+GATEWAY_RUNTIME = "runc"
 GATEWAY_CA_DIR = "/var/lib/agent-sandbox/ca"
 GATEWAY_TLS_DIR = "/sandbox-tls"
 AGENT_TLS_DIR = "/etc/agent-sandbox/tls"
@@ -74,6 +75,9 @@ def build(config: SandboxConfig) -> dict[str, Any]:
         **hardening,
         "image": config.gateway_image,
         "build": {"context": str(PACKAGE_DIR), "dockerfile": "docker/gateway.Dockerfile"},
+        # Always runc, whatever the daemon's default: under gVisor, inotify does not
+        # see the agent opening the canary files, so the tripwire would go blind.
+        "runtime": GATEWAY_RUNTIME,
         # Seeding the agent's home needs CHOWN/FOWNER/DAC_OVERRIDE; port 53 needs
         # NET_BIND_SERVICE. Nothing else.
         "cap_add": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "NET_BIND_SERVICE"],
@@ -103,6 +107,9 @@ def build(config: SandboxConfig) -> dict[str, Any]:
         **hardening,
         "image": config.agent_image,
         "build": {"context": str(PACKAGE_DIR), "dockerfile": "docker/agent.Dockerfile"},
+        # Under runsc the seccomp profile below is enforced by gVisor's kernel
+        # (the runtime must run with --oci-seccomp; see runtime.py).
+        "runtime": config.runtime,
         "depends_on": {"gateway": {"condition": "service_healthy"}},
         "user": "1000:1000",
         "init": True,

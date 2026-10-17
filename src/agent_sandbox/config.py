@@ -32,7 +32,7 @@ DEFAULT_ALLOW = (
     "raw.githubusercontent.com",
 )
 _SECTIONS = {
-    "sandbox": {"name", "agent_image"},
+    "sandbox": {"name", "agent_image", "runtime"},
     "network": {
         "allow",
         "extend_default_allow",
@@ -48,6 +48,9 @@ _SECTIONS = {
 }
 # What the gateway does with a request body it cannot decode for scanning.
 UNDECODABLE_POLICIES = ("block", "allow")
+# OCI runtimes the agent container can use: runc shares the host kernel, runsc
+# (gVisor) gives it a user-space kernel of its own.
+RUNTIMES = ("runc", "runsc")
 _MEMORY = re.compile(r"^\d+(\.\d+)?[kmg]?$", re.IGNORECASE)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -78,6 +81,7 @@ class SandboxConfig:
     canary_kinds: tuple[str, ...] = KINDS
     webhook: str | None = None
     agent_image: str = f"agent-sandbox/agent:{__version__}"
+    runtime: str = "runc"
     gateway_image: str = f"agent-sandbox/gateway:{__version__}"
 
     @property
@@ -198,6 +202,10 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
         except ValueError as exc:
             raise ConfigError(f"network.allow: {exc}") from None
 
+    runtime = sandbox.get("runtime", "runc")
+    if runtime not in RUNTIMES:
+        raise ConfigError(f"sandbox.runtime must be one of: {', '.join(RUNTIMES)}")
+
     tls_inspect = network.get("tls_inspect", False)
     if not isinstance(tls_inspect, bool):
         raise ConfigError("network.tls_inspect must be true or false")
@@ -258,4 +266,5 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
         canary_kinds=kinds,
         webhook=webhook,
         agent_image=str(sandbox.get("agent_image") or f"agent-sandbox/agent:{__version__}"),
+        runtime=runtime,
     )
