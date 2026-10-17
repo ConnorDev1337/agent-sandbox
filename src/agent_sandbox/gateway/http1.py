@@ -17,15 +17,43 @@ MAX_HEAD = 64 * 1024
 _TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _VERSION = re.compile(r"^HTTP/1\.[01]$")
 _CHUNK_SIZE = re.compile(rb"^[0-9A-Fa-f]{1,16}$")
+_METHOD = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_MAX_METHOD = 24
 # Proxy-only headers that must not travel past the gateway.
 _PROXY_HEADERS = frozenset({"proxy-authorization", "proxy-connection"})
+# The start of the HTTP/2 connection preface (RFC 9113, section 3.4), as read
+# up to its first empty line, and the reply refusing it: an empty SETTINGS
+# frame, then GOAWAY with HTTP_1_1_REQUIRED so the client can fall back.
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\n"
+H2_REFUSAL = (
+    b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+    b"\x00\x00\x08\x07\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x0d"
+)
 
 
 class ProxyError(Exception):
-    def __init__(self, status: int, reason: str) -> None:
+    """A request refused by the gateway, answered with ``status`` or a raw ``response``."""
+
+    def __init__(self, status: int, reason: str, response: bytes | None = None) -> None:
         super().__init__(reason)
         self.status = status
         self.reason = reason
+        self.response = response
+
+
+def request_start(data: bytes) -> bool | None:
+    """Tell whether a byte stream starts like an HTTP/1 request line.
+
+    Returns ``None`` while ``data`` could still be the start of a method, so a
+    request line split over several reads is not mistaken for another protocol.
+    """
+    match = _METHOD.match(data)
+    if match is None:
+        return False
+    if match.end() == len(data):
+        return None if len(data) < _MAX_METHOD else False
+    return data[match.end()] == ord(" ")
 
 
 @dataclass

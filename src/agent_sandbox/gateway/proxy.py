@@ -29,6 +29,8 @@ from ..canary import CanaryHit, CanaryMatcher
 from .alerts import EventLog
 from .decoding import MAX_DECODED, BodyScanner, DecodeError, content_codings
 from .http1 import (
+    H2_PREFACE,
+    H2_REFUSAL,
     MAX_HEAD,
     BufferedReader,
     ProxyError,
@@ -37,9 +39,17 @@ from .http1 import (
     chunk,
     chunk_size,
     parse_head,
+    request_start,
     serialize_head,
 )
-from .tls import TLSServerSession, hello_complete, looks_like_tls, server_name
+from .tls import (
+    NO_APPLICATION_PROTOCOL,
+    TLSServerSession,
+    alpn_protocols,
+    hello_complete,
+    looks_like_tls,
+    server_name,
+)
 
 __all__ = ["MAX_HEAD", "Proxy", "ProxyError", "Request", "parse_head", "serve", "split_host_port"]
 
@@ -149,7 +159,7 @@ class Proxy:
             else:
                 await self._forward(request, reader, writer, client_ip)
         except ProxyError as exc:
-            await self._reply(writer, exc.status, exc.reason)
+            await self._refuse(writer, exc)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
             pass
         except (ConnectionError, OSError):
@@ -158,6 +168,14 @@ class Proxy:
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
+
+    async def _refuse(self, writer: Sink, error: ProxyError) -> None:
+        if error.response is None:
+            await self._reply(writer, error.status, error.reason)
+            return
+        with contextlib.suppress(Exception):
+            writer.write(error.response)
+            await writer.drain()
 
     @staticmethod
     async def _reply(writer: Sink, status: int, reason: str) -> None:
@@ -220,6 +238,18 @@ class Proxy:
                 client=client,
             )
             raise ProxyError(403, f"blocked: {method} {path[:100]} is not allowed for {host}")
+
+    def _protocol_refused(
+        self, protocol: str, host: str, port: int, client: str, *, tls: bool
+    ) -> None:
+        self.log.event(
+            "egress.protocol_refused",
+            host=host,
+            port=port,
+            protocol=protocol[:100],
+            tls=tls,
+            client=client,
+        )
 
     def _undecodable(
         self, error: DecodeError, encoding: str, host: str, client: str, *, tls: bool
@@ -381,22 +411,24 @@ class Proxy:
                     first, reader, writer, upstream_reader, upstream_writer, host, port, client
                 )
                 return
-        elif self.allowlist.restricted(host, port):
-            # Method and path rules apply to plaintext tunnels as well.
-            self.log.event(
-                "egress.allowed",
-                host=host,
-                port=port,
-                method="CONNECT",
-                inspected=True,
-                client=client,
-            )
-            source = BufferedReader(lambda: reader.read(CHUNK), first)
-            await self._relay_session(
-                source, writer, upstream_reader, upstream_writer, host, port, client, tls=False
-            )
-            return
         else:
+            first = await self._read_start(reader, first)
+            if self.allowlist.restricted(host, port) or request_start(first):
+                # HTTP in a plaintext tunnel is relayed request by request, like
+                # plain HTTP: method and path rules apply, and bodies are decoded.
+                self.log.event(
+                    "egress.allowed",
+                    host=host,
+                    port=port,
+                    method="CONNECT",
+                    inspected=True,
+                    client=client,
+                )
+                source = BufferedReader(lambda: reader.read(CHUNK), first)
+                await self._relay_session(
+                    source, writer, upstream_reader, upstream_writer, host, port, client, tls=False
+                )
+                return
             self._check_canaries(first, client, where="tunnel data", host=host)
         self.log.event("egress.allowed", host=host, port=port, method="CONNECT", client=client)
         upstream_writer.write(first)
@@ -409,6 +441,16 @@ class Proxy:
             )
         finally:
             upstream_writer.close()
+
+    async def _read_start(self, reader: asyncio.StreamReader, first: bytes) -> bytes:
+        """Read until it is clear whether a plaintext tunnel starts with an HTTP request."""
+        data = first
+        while request_start(data) is None:
+            more = await asyncio.wait_for(reader.read(CHUNK), self.idle_timeout)
+            if not more:
+                break
+            data += more
+        return data
 
     async def _read_hello(self, reader: asyncio.StreamReader, first: bytes) -> bytes:
         """Buffer the whole ClientHello so a fragmented one cannot hide its SNI."""
@@ -468,6 +510,15 @@ class Proxy:
         client: str,
     ) -> None:
         """Terminate the agent's TLS, re-encrypt upstream and relay requests in between."""
+        offered = alpn_protocols(hello)
+        if offered is not None and not {"http/1.1", "http/1.0"} & set(offered):
+            # An HTTP/2-only client (gRPC...): requests could not be inspected.
+            self._protocol_refused(",".join(offered), host, port, client, tls=True)
+            with contextlib.suppress(Exception):
+                writer.write(NO_APPLICATION_PROTOCOL)
+                await writer.drain()
+            upstream_writer.close()
+            return
         upstream_error = None
         try:
             await asyncio.wait_for(
@@ -555,7 +606,7 @@ class Proxy:
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
             if isinstance(error, ProxyError):
-                await self._reply(client_writer, error.status, error.reason)
+                await self._refuse(client_writer, error)
         finally:
             for task in (relay, pump):
                 task.cancel()
@@ -605,11 +656,16 @@ class Proxy:
                 return
             except asyncio.LimitOverrunError:
                 raise ProxyError(431, "request head too large") from None
+            if head == H2_PREFACE:
+                self._protocol_refused("h2 (prior knowledge)", host, port, client, tls=tls)
+                raise ProxyError(505, "HTTP/2 is not supported", response=H2_REFUSAL)
             request = parse_head(head)
             self._check_canaries(head, client, where="request head", host=host, tls=tls)
             path = self._request_path(request, host, port, client, tls)
             self._check_request(host, port, request.method, path, client)
-            if request.header("upgrade") is not None:
+            upgrade = request.header("upgrade")
+            if upgrade is not None:
+                self._protocol_refused(upgrade, host, port, client, tls=tls)
                 raise ProxyError(501, "protocol upgrades are not supported by the gateway")
             length = body_length(request)
             scanner = self._body_scanner(request, host, client, tls=tls)

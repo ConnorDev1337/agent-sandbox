@@ -260,6 +260,34 @@ def test_canary_in_https_body_is_blocked(inspecting, tls_upstream, sandbox_ca, c
     assert secret not in (log.directory / "events.jsonl").read_text(encoding="utf-8")
 
 
+def test_http2_only_clients_get_a_clear_refusal(inspecting, tls_upstream, sandbox_ca, log):
+    target = f"127.0.0.1:{tls_upstream}"
+    h = inspecting()
+    with pytest.raises(ssl.SSLError, match=r"(?i)no.application.protocol"):
+        https(h.port, target, b"", str(sandbox_ca.cert), alpn=["h2"])
+    for _ in range(50):
+        events = read_jsonl(log.directory / "events.jsonl")
+        if any(e["kind"] == "egress.protocol_refused" for e in events):
+            break
+        threading.Event().wait(0.05)
+    refused = next(e for e in events if e["kind"] == "egress.protocol_refused")
+    assert refused["protocol"] == "h2" and refused["tls"] is True
+    assert TLSUpstream.received == []
+
+
+def test_websocket_upgrade_inside_tls_is_refused(inspecting, tls_upstream, sandbox_ca, log):
+    target = f"127.0.0.1:{tls_upstream}"
+    payload = (
+        f"GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
+    response, _ = https(inspecting().port, target, payload, str(sandbox_ca.cert))
+    assert response.startswith(b"HTTP/1.1 501")
+    refused = read_jsonl(log.directory / "events.jsonl")[-1]
+    assert refused["kind"] == "egress.protocol_refused" and refused["protocol"] == "websocket"
+    assert TLSUpstream.received == []
+
+
 def test_canary_in_gzip_https_body_is_blocked(inspecting, tls_upstream, sandbox_ca, canaries, log):
     target = f"127.0.0.1:{tls_upstream}"
     secret = next(c for c in canaries if c.kind == "github").secrets[0]
