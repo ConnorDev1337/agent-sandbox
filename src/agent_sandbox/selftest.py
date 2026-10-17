@@ -12,13 +12,16 @@ import argparse
 import ctypes
 import ctypes.util
 import errno
+import gzip
 import http.client
 import json
 import os
 import platform
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -275,6 +278,76 @@ def _forbidden_method(args):
                             method=args.forbidden_method)  # fmt: skip
     ok = status == 403 and "agent-sandbox gateway" in detail
     return ok, f"{args.forbidden_method} {url} status={status} {detail[:70]}".strip()
+
+
+@check("canary in a gzip-encoded request body is blocked")
+def _gzip_exfiltration(args):
+    secret = _canary_secret()
+    if secret is None:
+        return False, "no canary found in ~/.aws/credentials"
+    # Inspected HTTPS when available, plain HTTP otherwise: both decode bodies.
+    scheme = "https" if args.tls_inspect else "http"
+    request = urllib.request.Request(  # noqa: S310 - test URL
+        f"{scheme}://{args.allowed_host}/upload",
+        data=gzip.compress(f"k={secret}".encode()),
+        headers={"Content-Encoding": "gzip", "Content-Type": "text/plain"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:  # noqa: S310
+            status, detail = response.status, ""
+    except urllib.error.HTTPError as exc:
+        status, detail = exc.code, exc.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as exc:
+        status, detail = None, str(getattr(exc, "reason", exc))
+    ok = status == 403 and "canary" in detail
+    return ok, f"{scheme} status={status} {detail[:70]}".strip()
+
+
+# Node.js built-in fetch, with the outcome printed as one JSON line.
+NODE_FETCH = """
+fetch(process.argv[1], {signal: AbortSignal.timeout(Number(process.argv[2]))})
+  .then(r => console.log(JSON.stringify({version: process.version, status: r.status})))
+  .catch(e => console.log(JSON.stringify({version: process.version,
+                                          error: String((e && e.cause) || e)})));
+"""
+
+
+def _node_fetch(url: str) -> dict[str, object] | None:
+    """Fetch ``url`` with Node's ``fetch``; ``None`` if Node.js is not installed."""
+    node = shutil.which("node")
+    if node is None:
+        return None
+    result = subprocess.run(  # noqa: S603 - fixed argv
+        [node, "-e", NODE_FETCH, url, str(int(TIMEOUT * 1000))],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT + 10,
+    )
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return {"error": result.stderr.strip()[-200:] or f"exit code {result.returncode}"}
+    return json.loads(lines[-1])
+
+
+@check("Node.js fetch reaches an allowlisted host through the proxy")
+def _node_allowed(args):
+    # With TLS inspection this also proves Node trusts the sandbox CA.
+    outcome = _node_fetch(f"https://{args.allowed_host}/")
+    if outcome is None:
+        return None, "node is not installed in the agent image"
+    status = outcome.get("status")
+    ok = isinstance(status, int) and status < 500
+    return ok, f"node {outcome.get('version', '?')} status={status} {outcome.get('error', '')}"
+
+
+@check("Node.js fetch to other hosts is refused by the proxy")
+def _node_denied(args):
+    outcome = _node_fetch(f"https://{args.denied_host}/")
+    if outcome is None:
+        return None, "node is not installed in the agent image"
+    error = str(outcome.get("error", ""))
+    ok = "status" not in outcome and "403" in error
+    return ok, f"node {outcome.get('version', '?')} {error[:100]}".strip()
 
 
 def main(argv: list[str] | None = None) -> int:
