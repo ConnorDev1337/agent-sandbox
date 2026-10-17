@@ -435,27 +435,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--keep", action="store_true", help="leave the sandbox and the images in place"
     )
+    parser.add_argument(
+        "--compose-only",
+        action="store_true",
+        help="only write the demo Compose file and print its path (no Docker, no checkouts)",
+    )
     return parser.parse_args(argv)
+
+
+def prepare(out: Path) -> SandboxConfig:
+    """Copy the workspace into ``out`` and write the canaries and the Compose file."""
+    shutil.rmtree(out / "workspace" / "evidence", ignore_errors=True)
+    shutil.copytree(HERE / "workspace", out / "workspace", dirs_exist_ok=True)
+    # Keep the sandbox state (canary registry, gateway logs) inside the output dir.
+    os.environ["AGENT_SANDBOX_HOME"] = str(out / "state")
+    config = demo_config(out / "workspace")
+    cli._ensure_canaries(config)
+    write_compose(config)
+    return config
 
 
 def main(argv: list[str] | None = None) -> int:
     sys.stdout.reconfigure(line_buffering=True)
     args = parse_args(argv)
+    out = args.out.resolve()
+    if args.compose_only:
+        print(prepare(out).compose_file)
+        return 0
     for name, path in (("tool-call-guard", args.toolguard_src), ("scanner", args.scanner_src)):
         if not (path / "pyproject.toml").is_file():
             raise DemoError(f"{name} checkout not found at {path}")
 
-    out = args.out.resolve()
     evidence = out / "evidence"
-    workspace = out / "workspace"
     shutil.rmtree(evidence, ignore_errors=True)
-    shutil.rmtree(workspace / "evidence", ignore_errors=True)
     evidence.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(HERE / "workspace", workspace, dirs_exist_ok=True)
-    # Keep the sandbox state (canary registry, gateway logs) inside the output dir.
-    os.environ["AGENT_SANDBOX_HOME"] = str(out / "state")
-
-    config = demo_config(workspace)
+    config = prepare(out)
     images = [config.agent_image, AGENT_BASE_IMAGE, GATEWAY_IMAGE]
     started = _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
     try:
@@ -466,8 +480,6 @@ def main(argv: list[str] | None = None) -> int:
         report = preflight_scan(config, evidence)
 
         _section("3. Start the sandbox (allowlist, canaries, TLS inspection)")
-        cli._ensure_canaries(config)
-        write_compose(config)
         _run(cli.compose_command(config, "up", "-d", "--wait"), capture=True)
         print(f"sandbox {config.project} is up (subnet {config.subnet}, tls_inspect=on)")
 

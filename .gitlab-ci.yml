@@ -32,8 +32,8 @@ lint:
   extends: .pip-cache
   script:
     - pip install -e ".[dev]"
-    - ruff check src tests
-    - ruff format --check src tests
+    - ruff check src tests examples
+    - ruff format --check src tests examples
     - python -m agent_sandbox.seccomp --check
 
 test:
@@ -85,6 +85,11 @@ compose-config:
       docker compose
       -f "$(agent-sandbox -w /tmp/workspace config | python3 -c 'import json,sys;
       print(json.load(sys.stdin)["state_dir"])')/compose.json" config --quiet
+    # The defense-in-depth example's Compose file (labels, demo images, no build).
+    - >
+      docker compose -f "$(python3
+      "$CI_PROJECT_DIR/examples/defense-in-depth/demo.py"
+      --compose-only --out /tmp/demo-out)" config --quiet
 
 gvisor-end-to-end:
   # Self-test under gVisor (runsc, systrap platform) and, as a control, runc:
