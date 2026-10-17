@@ -37,6 +37,15 @@ def test_parse_head_accepts_well_formed_requests():
         b"GET  / HTTP/1.1\r\n\r\n",
         b"G(T / HTTP/1.1\r\n\r\n",
         b"GET /\r\n\r\n",
+        # Found by tests/test_fuzz_http1.py: targets servers may read differently,
+        # control characters in values, and a second request after the empty line.
+        b"GET #/ HTTP/1.0\r\n\r\n",
+        b"GET /a\tb HTTP/1.1\r\n\r\n",
+        b"GET /a\x0bb HTTP/1.1\r\n\r\n",
+        b"GET /..\xc0\xafx HTTP/1.1\r\n\r\n",
+        b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\x0b\r\n\r\n",
+        b"GET / HTTP/1.1\r\nA: \x7f\r\n\r\n",
+        b"GET / HTTP/1.1\r\n\r\nHost: evil.example\r\n\r\n",
     ],
 )
 def test_parse_head_refuses_ambiguous_heads(raw):
@@ -68,6 +77,13 @@ def test_body_length(headers, expected):
         (("Content-Length: 1, 1",), 400),
         (("Content-Length: -1",), 400),
         (("Content-Length: 1234567890123456789",), 400),
+        # Found by tests/test_fuzz_http1.py: str.isdigit() accepts superscripts,
+        # which int() refuses, and str.strip() removes more than SP and HTAB, so
+        # a coding a server may not take for chunked was forwarded as is.
+        (("Content-Length: \xb2",), 400),
+        (("Content-Length: 5\xa0",), 400),
+        (("Transfer-Encoding: \xa0chunked",), 501),
+        (("Transfer-Encoding: chunked\x85",), 501),
     ],
 )
 def test_body_length_refuses_ambiguous_framing(headers, status):
@@ -76,10 +92,19 @@ def test_body_length_refuses_ambiguous_framing(headers, status):
     assert info.value.status == status
 
 
+def test_transfer_encoding_in_http_1_0_is_refused():
+    # Found by tests/test_fuzz_http1.py: such framing is faulty (RFC 9112, 6.1).
+    with pytest.raises(ProxyError) as info:
+        body_length(parse_head(head("POST / HTTP/1.0", "Transfer-Encoding: chunked")))
+    assert info.value.status == 400
+
+
 def test_chunk_helpers():
     assert chunk_size(b"1a\r\n") == 26
     assert chunk_size(b"A;name=value\r\n") == 10
-    for bad in (b"0x10\r\n", b"1_0\r\n", b"+5\r\n", b"\r\n", b"12345678901234567\r\n"):
+    bad_lines = (b"0x10\r\n", b"1_0\r\n", b"+5\r\n", b"\r\n", b"12345678901234567\r\n")
+    # Found by tests/test_fuzz_http1.py: bare CR or LF before the CRLF.
+    for bad in (*bad_lines, b"0\r\r\n", b"5\n\r\n", b"5;a\nb\r\n"):
         with pytest.raises(ProxyError):
             chunk_size(bad)
     assert chunk(b"hello") == b"5\r\nhello\r\n"
@@ -139,7 +164,14 @@ def test_buffered_reader_limits_and_partial_reads():
         (b"SSH-2.0-OpenSSH_9.6\r\n", False),
         (b"SSH-2.0-OpenSSH_9.6", None),
         (b"\x16\x03\x01", False),
-        (b"X" * 30, False),
+        # Found by tests/test_fuzz_http1.py: requests lenient servers accept were
+        # relayed unparsed (so undecoded), and the answer for a long method
+        # depended on the reads (False for 24 bytes, True for 25 and a space).
+        (b"X" * 30, None),
+        (b"X" * 30 + b" / HTTP/1.1", True),
+        (b"\r\nPOST / HTTP/1.1", True),
+        (b" POST / HTTP/1.1", True),
+        (b"POST\t/ HTTP/1.1", True),
     ],
 )
 def test_request_start(data, expected):
