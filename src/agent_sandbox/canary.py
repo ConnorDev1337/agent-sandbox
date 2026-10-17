@@ -29,7 +29,9 @@ MIN_NEEDLE = 12  # shorter encoded fragments would cause false positives
 # Canary values never contain whitespace, so it is removed before searching:
 # a value wrapped over several lines is then found like an unwrapped one.
 _WHITESPACE = b" \t\r\n\x0b\x0c"
-_SOFT_BREAK = re.compile(rb"=\r?\n")  # quoted-printable soft line break
+# Quoted-printable soft line break, with the trailing whitespace that decoders
+# must ignore (RFC 2045, section 6.7).
+_SOFT_BREAK = re.compile(rb"=[ \t]*\r?\n")
 _ESCAPE = re.compile(rb"%[0-9a-f]{2}")  # in lowercased data
 SPAN = 3  # a match may span up to SPAN times its length (percent-encoding)
 
@@ -212,6 +214,14 @@ def encodings(value: str) -> dict[str, set[str]]:
     }
 
 
+def _normalize(data: bytes) -> bytes:
+    """Lowercase ``data``, without whitespace and quoted-printable soft line breaks."""
+    view = data.lower()
+    if b"=" in view and b"\n" in view:
+        view = _SOFT_BREAK.sub(b"", view)
+    return view.translate(None, _WHITESPACE)
+
+
 class CanaryMatcher:
     """Case-insensitive search for canary values and hostnames in arbitrary data."""
 
@@ -236,10 +246,7 @@ class CanaryMatcher:
 
     def _views(self, data: bytes) -> list[tuple[bytes, str]]:
         """Return normalized forms of ``data`` to search, with a label for each."""
-        view = data.lower()
-        if b"=\n" in view or b"=\r\n" in view:
-            view = _SOFT_BREAK.sub(b"", view)
-        view = view.translate(None, _WHITESPACE)
+        view = _normalize(data)
         views = [(view, "")]
         if b"%" in view:
             # Only the surroundings of escapes can decode to something new, so
@@ -256,7 +263,8 @@ class CanaryMatcher:
             if end >= 0:
                 parts.append(view[start:end])
                 decoded = b"\0".join(unquote_to_bytes(part) for part in parts)
-                views.append((decoded.lower().translate(None, _WHITESPACE), " (percent-decoded)"))
+                # Line breaks, soft ones included, may have been percent-encoded too.
+                views.append((_normalize(decoded), " (percent-decoded)"))
         return views
 
     def scan(self, data: bytes | str) -> list[CanaryHit]:
