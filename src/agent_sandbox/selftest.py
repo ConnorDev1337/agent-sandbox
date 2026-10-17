@@ -289,8 +289,10 @@ def _tls_intercepted(args):
 
 @check("TLS passthrough host presents its own certificate")
 def _tls_passthrough(args):
-    if not args.tls_inspect or not args.passthrough_host:
-        return None, "no inspect = false entry in network.allow under TLS inspection"
+    if not args.tls_inspect:
+        return None, "TLS inspection is off"
+    if not args.passthrough_host:
+        return None, "no inspect = false entry in network.allow"
     # Verified against the system roots alone: a certificate minted by the
     # sandbox CA would fail here.
     cafile = SYSTEM_BUNDLE if Path(SYSTEM_BUNDLE).is_file() else None
