@@ -1,17 +1,23 @@
 """TLS inspection: certificate minting and the intercepting proxy, end to end in-process.
 
 Certificates are created with the openssl command line tool, as in the gateway
-image; the tests are skipped where it is not installed.
+image. The certificate tests run once per OpenSSL-compatible binary found:
+``openssl`` on the PATH, ``/usr/bin/openssl`` (LibreSSL on macOS) and every
+binary listed in the ``OPENSSL`` environment variable (separated like PATH),
+which must exist, e.g. ``OPENSSL=/usr/bin/libressl`` on Alpine. The other
+tests use the first binary found. Everything is skipped where there is none.
 """
 
 import asyncio
 import contextlib
 import gzip
+import os
 import shutil
 import socket
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
@@ -22,12 +28,39 @@ from agent_sandbox.gateway import certs
 from agent_sandbox.gateway.alerts import EventLog
 from test_gateway import ProxyHarness, _client_hello, read_jsonl
 
-pytestmark = pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl not installed")
+
+def openssl_binaries() -> list[tuple[str, str]]:
+    """Return ``(path, version)`` for each distinct binary to mint certificates with."""
+    required = [path for path in os.environ.get("OPENSSL", "").split(os.pathsep) if path]
+    missing = [path for path in required if shutil.which(path) is None]
+    if missing:
+        raise RuntimeError(f"OPENSSL lists binaries that cannot be run: {', '.join(missing)}")
+    found: dict[str, tuple[str, str]] = {}
+    for candidate in (shutil.which("openssl"), "/usr/bin/openssl", *required):
+        path = shutil.which(candidate) if candidate else None
+        if path is not None:
+            found.setdefault(os.path.realpath(path), (path, certs.openssl_version(path)))
+    return list(found.values())
+
+
+OPENSSL = openssl_binaries()
+pytestmark = pytest.mark.skipif(not OPENSSL, reason="openssl not installed")
+
+
+@pytest.fixture(
+    scope="module",
+    params=[path for path, _ in OPENSSL],
+    ids=["-".join(version.split()[:2]) for _, version in OPENSSL],
+)
+def openssl(request):
+    """Each OpenSSL-compatible binary in turn (OpenSSL, LibreSSL)."""
+    return request.param
 
 
 @pytest.fixture(scope="module")
 def sandbox_ca(tmp_path_factory):
-    return certs.CertificateAuthority.load_or_create(tmp_path_factory.mktemp("sandbox-ca"))
+    directory = tmp_path_factory.mktemp("sandbox-ca")
+    return certs.CertificateAuthority.load_or_create(directory, OPENSSL[0][0])
 
 
 @pytest.fixture(scope="module")
@@ -38,7 +71,8 @@ def issuer(sandbox_ca, tmp_path_factory):
 @pytest.fixture(scope="module")
 def upstream_ca(tmp_path_factory):
     """A separate CA standing in for the public PKI the gateway verifies against."""
-    return certs.CertificateAuthority.load_or_create(tmp_path_factory.mktemp("public-ca"))
+    directory = tmp_path_factory.mktemp("public-ca")
+    return certs.CertificateAuthority.load_or_create(directory, OPENSSL[0][0])
 
 
 class TLSUpstream(BaseHTTPRequestHandler):
@@ -141,12 +175,20 @@ def memory_handshake(client_context, server_context, server_hostname):
 # ---------------------------------------------------------------------------- certificates
 
 
-def test_ca_is_created_once_and_published_without_its_key(tmp_path):
-    ca = certs.CertificateAuthority.load_or_create(tmp_path / "ca")
+def test_openssl_flavour_is_detected(openssl):
+    version = certs.openssl_version(openssl)
+    assert version.split()[0] in {"OpenSSL", "LibreSSL"}, version
+    with pytest.raises(certs.CertificateError, match="cannot run"):
+        certs.openssl_version(openssl + "-missing")
+
+
+def test_ca_is_created_once_and_published_without_its_key(tmp_path, openssl):
+    ca = certs.CertificateAuthority.load_or_create(tmp_path / "ca", openssl)
     fingerprint = ca.fingerprint()
     assert len(fingerprint.split(":")) == 32
-    again = certs.CertificateAuthority.load_or_create(tmp_path / "ca")
+    again = certs.CertificateAuthority.load_or_create(tmp_path / "ca", openssl)
     assert again.fingerprint() == fingerprint  # kept across gateway restarts
+    assert sorted(p.name for p in (tmp_path / "ca").iterdir()) == ["ca.crt", "ca.key"]
     system = tmp_path / "system.crt"
     system.write_text("-----BEGIN CERTIFICATE-----\nsystem\n-----END CERTIFICATE-----", "ascii")
     bundle = ca.write_bundle(tmp_path / "published", system)
@@ -162,18 +204,31 @@ def test_ca_is_created_once_and_published_without_its_key(tmp_path):
     assert (tmp_path / "no-system" / "ca-bundle.crt").read_text("ascii") == ca.pem()
 
 
-def test_leaf_certificates_verify_strictly_and_are_cached(sandbox_ca, issuer):
-    client = ssl.create_default_context(cafile=str(sandbox_ca.cert))
+def test_leaf_certificates_verify_strictly_and_are_cached(tmp_path, openssl):
+    ca = certs.CertificateAuthority.load_or_create(tmp_path / "ca", openssl)
+    issuer = certs.LeafIssuer(ca, tmp_path / "leaves")
+    client = ssl.create_default_context(cafile=str(ca.cert))
     client.verify_flags |= ssl.VERIFY_X509_STRICT
     context = asyncio.run(issuer.context_for("pypi.org"))
     assert asyncio.run(issuer.context_for("pypi.org")) is context
-    session = memory_handshake(client, context, "pypi.org")
-    issuer_name = dict(item[0] for item in session.getpeercert()["issuer"])
+    leaf = memory_handshake(client, context, "pypi.org").getpeercert()
+    issuer_name = dict(item[0] for item in leaf["issuer"])
     assert issuer_name["organizationName"] == "agent-sandbox"
+    assert leaf["subjectAltName"] == (("DNS", "pypi.org"),)
+    days = (ssl.cert_time_to_seconds(leaf["notAfter"]) - time.time()) / 86400
+    assert certs.LEAF_DAYS - 2 < days <= certs.LEAF_DAYS
     ip_context = asyncio.run(issuer.context_for("93.184.216.34"))
-    memory_handshake(client, ip_context, "93.184.216.34")
+    ip_leaf = memory_handshake(client, ip_context, "93.184.216.34").getpeercert()
+    assert ip_leaf["subjectAltName"] == (("IP Address", "93.184.216.34"),)
+    assert ip_leaf["serialNumber"] != leaf["serialNumber"]
     with pytest.raises(ssl.SSLError):  # server name other than the one minted for
         memory_handshake(client, context, "evil.example")
+    # Only the shared key, request and configuration stay on disk.
+    assert sorted(p.name for p in (tmp_path / "leaves").iterdir()) == [
+        "leaf.cnf",
+        "leaf.csr",
+        "leaf.key",
+    ]
 
 
 def test_concurrent_requests_share_one_mint_and_cache_is_bounded(sandbox_ca, tmp_path):
@@ -196,12 +251,12 @@ def test_concurrent_requests_share_one_mint_and_cache_is_bounded(sandbox_ca, tmp
     ]
 
 
-def test_openssl_failures_are_reported(tmp_path, monkeypatch, sandbox_ca):
+def test_openssl_failures_are_reported(tmp_path, monkeypatch, sandbox_ca, openssl):
     with pytest.raises(certs.CertificateError, match="openssl"):
         certs.CertificateAuthority.load_or_create(tmp_path / "ca", openssl=str(tmp_path / "nope"))
     assert not (tmp_path / "ca" / "ca.key").exists()
-    broken = certs.LeafIssuer(sandbox_ca, tmp_path / "leaves")
-    broken.ca = certs.CertificateAuthority(tmp_path / "missing", sandbox_ca.openssl)
+    broken = certs.LeafIssuer(certs.CertificateAuthority(sandbox_ca.directory, openssl), tmp_path)
+    broken.ca = certs.CertificateAuthority(tmp_path / "missing", openssl)
     with pytest.raises(certs.CertificateError, match="cannot mint"):
         asyncio.run(broken.context_for("x.example"))
     monkeypatch.setattr(certs.shutil, "which", lambda name: None)
@@ -209,8 +264,8 @@ def test_openssl_failures_are_reported(tmp_path, monkeypatch, sandbox_ca):
         certs.find_openssl()
 
 
-def test_prepare_publishes_bundle_and_returns_issuer(tmp_path):
-    issuer = certs.prepare(tmp_path / "ca", tmp_path / "tls", tmp_path / "work")
+def test_prepare_publishes_bundle_and_returns_issuer(tmp_path, openssl):
+    issuer = certs.prepare(tmp_path / "ca", tmp_path / "tls", tmp_path / "work", openssl=openssl)
     assert (tmp_path / "tls" / "ca.crt").read_text("ascii") == issuer.ca.pem()
     assert certs.subject_alt_name("::1") == "IP:::1"
     assert certs.subject_alt_name("pypi.org") == "DNS:pypi.org"
