@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import contextlib
+import gzip
 import json
 import socket
 import struct
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
@@ -194,6 +196,56 @@ def test_canary_in_body_is_blocked_and_alerted(harness, upstream, canaries, log,
     assert alert["canary_kind"] == "aws" and secret not in json.dumps(alert)
 
 
+def _post(port, body, *headers):
+    head = f"POST http://127.0.0.1:{port}/upload HTTP/1.1\r\nContent-Length: {len(body)}\r\n"
+    return (head + "".join(f"{h}\r\n" for h in headers) + "\r\n").encode() + body
+
+
+def test_canary_in_gzip_body_is_blocked(harness, upstream, canaries, log):
+    secret = next(c for c in canaries if c.kind == "aws").secrets[1]
+    h = harness([f"127.0.0.1:{upstream}"])
+    body = gzip.compress(f"k={secret}".encode())
+    response = h.raw(_post(upstream, body, "Content-Encoding: gzip"))
+    assert response.startswith(b"HTTP/1.1 403") and b"canary" in response
+    assert not Upstream.received
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["encoding"] == "plain in gzip" and "(plain in gzip)" in alert["message"]
+
+
+def test_clean_encoded_body_is_forwarded_unchanged(harness, upstream):
+    h = harness([f"127.0.0.1:{upstream}"])
+    body = zlib.compress(gzip.compress(b"hello " * 100))
+    response = h.raw(_post(upstream, body, "Content-Encoding: gzip, deflate"))
+    assert response.endswith(b"hello from upstream")
+    assert Upstream.received[0][2] == body
+
+
+@pytest.mark.parametrize("policy", ["block", "allow"])
+def test_undecodable_body_policy(harness, upstream, log, policy):
+    h = harness([f"127.0.0.1:{upstream}"], undecodable_bodies=policy)
+    for body, encoding in ((b"opaque", "br"), (b"not gzip", "gzip")):
+        response = h.raw(_post(upstream, body, f"Content-Encoding: {encoding}"))
+        if policy == "block":
+            assert response.startswith((b"HTTP/1.1 415", b"HTTP/1.1 400"))
+            assert b"cannot be scanned" in response
+        else:
+            assert response.endswith(b"hello from upstream")
+    events = [
+        e
+        for e in read_jsonl(log.directory / "events.jsonl")
+        if e["kind"] == "egress.undecodable_body"
+    ]
+    assert [(e["encoding"], e["action"]) for e in events] == [
+        ("br", "blocked" if policy == "block" else "allowed"),
+        ("gzip", "blocked" if policy == "block" else "allowed"),
+    ]
+    assert "unsupported content coding br" in events[0]["reason"]
+    assert len(read_jsonl(log.directory / "alerts.jsonl")) == (2 if policy == "block" else 0)
+    assert len(Upstream.received) == (0 if policy == "block" else 2)
+    with pytest.raises(ValueError, match="policy"):
+        Proxy(Allowlist([]), CanaryMatcher([]), log, undecodable_bodies="drop")
+
+
 def test_chunked_body_and_expect_continue(harness, upstream, canaries):
     secret = next(c for c in canaries if c.kind == "github").secrets[0].encode()
     h = harness([f"127.0.0.1:{upstream}"])
@@ -364,6 +416,24 @@ def test_canary_split_across_chunks_is_never_released(harness, upstream, canarie
     (alert,) = read_jsonl(log.directory / "alerts.jsonl")
     assert alert["where"] == "request body" and alert["tls"] is False
     assert all(secret[:20] not in r[2] for r in Upstream.received)
+
+
+def test_streamed_gzip_body_never_releases_a_canary(harness, upstream, canaries, log):
+    secret = next(c for c in canaries if c.kind == "dotenv").secrets[1].encode()
+    target = f"127.0.0.1:{upstream}"
+    h = harness(_restricted(upstream, {"methods": ["POST"]}), max_body=1024)
+    body = gzip.compress(bytes(range(256)) * 400 + secret + b"z" * 10)
+    request = (
+        f"POST /x HTTP/1.1\r\nHost: {target}\r\nContent-Length: {len(body)}\r\n"
+        "Content-Encoding: gzip\r\n\r\n"
+    ).encode() + body
+    response = h.raw(f"CONNECT {target} HTTP/1.1\r\n\r\n".encode(), read_after=request)
+    assert response.startswith(b"HTTP/1.1 403")
+    (alert,) = read_jsonl(log.directory / "alerts.jsonl")
+    assert alert["where"] == "request body" and alert["encoding"] == "plain in gzip"
+    for received in Upstream.received:
+        decoded = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(received[2])
+        assert secret[:12] not in decoded
 
 
 def test_restricted_tunnel_chunked_body_is_rechunked(harness, upstream):

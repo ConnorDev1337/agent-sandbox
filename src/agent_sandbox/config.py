@@ -33,12 +33,21 @@ DEFAULT_ALLOW = (
 )
 _SECTIONS = {
     "sandbox": {"name", "agent_image"},
-    "network": {"allow", "extend_default_allow", "default_ports", "subnet", "tls_inspect"},
+    "network": {
+        "allow",
+        "extend_default_allow",
+        "default_ports",
+        "subnet",
+        "tls_inspect",
+        "undecodable_bodies",
+    },
     "resources": {"cpus", "memory", "pids"},
     "env": {"pass", "set"},
     "canaries": {"kinds"},
     "alerts": {"webhook"},
 }
+# What the gateway does with a request body it cannot decode for scanning.
+UNDECODABLE_POLICIES = ("block", "allow")
 _MEMORY = re.compile(r"^\d+(\.\d+)?[kmg]?$", re.IGNORECASE)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -60,6 +69,7 @@ class SandboxConfig:
     default_ports: tuple[int, ...] = (80, 443)
     subnet: str = "172.31.250.0/24"
     tls_inspect: bool = False
+    undecodable_bodies: str = "allow"  # load() defaults to "block" with tls_inspect
     cpus: float = 2.0
     memory: str = "4g"
     pids: int = 512
@@ -129,6 +139,7 @@ class SandboxConfig:
             "allow": [dict(e) if isinstance(e, dict) else e for e in self.allow],
             "default_ports": list(self.default_ports),
             "tls_inspect": self.tls_inspect,
+            "undecodable_bodies": self.undecodable_bodies,
             "webhook": self.webhook,
             "uid": 1000,
             "gid": 1000,
@@ -190,6 +201,11 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
     tls_inspect = network.get("tls_inspect", False)
     if not isinstance(tls_inspect, bool):
         raise ConfigError("network.tls_inspect must be true or false")
+    # Inspection is the opt-in to content scanning, so a body it cannot read is
+    # refused by default; without it HTTPS is not scanned at all anyway.
+    undecodable = network.get("undecodable_bodies", "block" if tls_inspect else "allow")
+    if undecodable not in UNDECODABLE_POLICIES:
+        raise ConfigError('network.undecodable_bodies must be "block" or "allow"')
 
     subnet = str(network.get("subnet", "172.31.250.0/24"))
     try:
@@ -233,6 +249,7 @@ def load(workspace: str | Path, path: Path | None = None) -> SandboxConfig:
         default_ports=tuple(ports),
         subnet=str(net),
         tls_inspect=tls_inspect,
+        undecodable_bodies=undecodable,
         cpus=float(cpus),
         memory=memory,
         pids=pids,
