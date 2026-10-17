@@ -15,9 +15,21 @@ class FakeDocker:
         self.calls = []
         self.stdout = ""
         self.returncode = 0
+        # What `docker info` reports; None makes it fail like an unreachable daemon.
+        self.info = {
+            "ServerVersion": "29.0.0",
+            "OperatingSystem": "Test Linux",
+            "KernelVersion": "6.8.0-test",
+            "DefaultRuntime": "runc",
+            "Runtimes": {"runc": {"path": "runc"}},
+        }
 
     def __call__(self, command, check=True, text=True, capture_output=False, **kwargs):
         self.calls.append(command)
+        if command[1] == "info":
+            if self.info is None:
+                raise subprocess.CalledProcessError(1, command, stderr="cannot connect")
+            return subprocess.CompletedProcess(command, 0, json.dumps(self.info), "")
         if check and self.returncode:
             raise subprocess.CalledProcessError(self.returncode, command, stderr="boom")
         return subprocess.CompletedProcess(command, self.returncode, self.stdout, "")
@@ -198,3 +210,97 @@ def test_config_and_help(capsys, workspace):
     assert code == 0 and payload["gateway_ip"] == "172.31.250.2"
     assert payload["tls_inspect"] is False and payload["undecodable_bodies"] == "allow"
     assert cli.main([]) == 2
+
+
+def use_runtime(workspace, runtime):
+    (workspace / ".agent-sandbox.toml").write_text(
+        f'[sandbox]\nruntime = "{runtime}"\n', encoding="utf-8"
+    )
+
+
+def register_runsc(docker, *args):
+    docker.info["Runtimes"]["runsc"] = {"path": "/usr/local/bin/runsc", "runtimeArgs": [*args]}
+
+
+def test_up_with_runsc_refuses_a_daemon_without_it(capsys, workspace, docker):
+    use_runtime(workspace, "runsc")
+    code, _, err = run(capsys, workspace, "up")
+    assert code == 2 and "no runsc runtime" in err and "runsc install" in err
+    assert [call[1] for call in docker.calls] == ["info"]  # nothing was started
+    register_runsc(docker)
+    code, _, err = run(capsys, workspace, "up")
+    assert code == 2 and "without --oci-seccomp" in err
+    docker.info = None
+    code, _, err = run(capsys, workspace, "up")
+    assert code == 2 and "cannot connect" in err
+
+
+def test_up_with_runsc(capsys, workspace, docker):
+    use_runtime(workspace, "runsc")
+    register_runsc(docker, "--oci-seccomp")
+    assert run(capsys, workspace, "up")[0] == 0
+    assert docker.calls[-1][-3:] == ["up", "-d", "--wait"]
+    spec = json.loads(load(workspace).compose_file.read_text(encoding="utf-8"))
+    assert spec["services"]["agent"]["runtime"] == "runsc"
+    assert spec["services"]["gateway"]["runtime"] == "runc"
+
+
+def test_up_with_runc_tolerates_docker_info_failures(capsys, workspace, docker):
+    docker.info = None
+    assert run(capsys, workspace, "up")[0] == 0
+    docker.info = {"Runtimes": {}}
+    assert run(capsys, workspace, "up")[0] == 0
+    docker.info = []
+    assert run(capsys, workspace, "up")[0] == 0
+    assert docker.calls[-1][-3:] == ["up", "-d", "--wait"]
+
+
+def test_up_warns_when_runc_overrides_a_gvisor_default(capsys, workspace, docker):
+    register_runsc(docker, "--oci-seccomp")
+    docker.info["DefaultRuntime"] = "runsc"
+    code, _, err = run(capsys, workspace, "up")
+    assert code == 0 and "warning: the Docker daemon runs containers under runsc" in err
+
+
+def test_verify_passes_the_runtime_to_the_self_test(capsys, workspace, docker, monkeypatch):
+    use_runtime(workspace, "runsc")
+    register_runsc(docker, "--oci-seccomp")
+    docker.stdout = json.dumps({"check": "a", "ok": True, "detail": "ok"})
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    run(capsys, workspace, "verify")
+    selftest_call = docker.calls[-1]
+    assert "selftest.py" in selftest_call[selftest_call.index("agent") + 2]
+    position = selftest_call.index("--runtime")
+    assert selftest_call[position : position + 4] == [
+        "--runtime",
+        "runsc",
+        "--host-kernel",
+        "6.8.0-test",
+    ]
+    docker.info = None  # with --no-up and runc, verify does without the host kernel
+    use_runtime(workspace, "runc")
+    run(capsys, workspace, "verify", "--no-up")
+    assert "--host-kernel" not in docker.calls[-1]
+    assert docker.calls[-1][docker.calls[-1].index("--runtime") + 1] == "runc"
+
+
+def test_doctor(capsys, workspace, docker):
+    code, out, _ = run(capsys, workspace, "doctor")
+    assert code == 0 and "29.0.0 (Test Linux)" in out and "agent      runc: ok" in out
+    use_runtime(workspace, "runsc")
+    code, _, err = run(capsys, workspace, "doctor")
+    assert code == 2 and "no runsc runtime" in err
+    register_runsc(docker, "--oci-seccomp")
+    code, out, _ = run(capsys, workspace, "doctor")
+    assert code == 0 and "runsc      /usr/local/bin/runsc --oci-seccomp" in out
+    docker.info["Runtimes"]["runsc"] = {"runtimeType": "io.containerd.runsc.v1"}
+    code, out, err = run(capsys, workspace, "doctor")
+    assert code == 0 and "io.containerd.runsc.v1" in out and "cannot confirm" in err
+    docker.info = None
+    assert run(capsys, workspace, "doctor")[0] == 2
+
+
+def test_runtime_in_init_and_config(capsys, workspace):
+    use_runtime(workspace, "runsc")
+    assert "runtime    runsc" in run(capsys, workspace, "init")[1]
+    assert json.loads(run(capsys, workspace, "config")[1])["runtime"] == "runsc"

@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -192,3 +194,66 @@ def test_node_checks(monkeypatch):
     assert ok and "403" in detail
     assert selftest._node_fetch("https://other.example/") == {"error": "boom"}
     assert selftest._node_allowed(_args(allowed_host="other.example"))[0] is False
+
+
+def _runtime_args(runtime="runsc", host_kernel="6.8.0-generic"):
+    return type("Args", (), {"runtime": runtime, "host_kernel": host_kernel})()
+
+
+@pytest.mark.parametrize(
+    ("version", "release", "host", "ok"),
+    [
+        ("Linux version 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016", "4.19.0-gvisor",
+         "6.8.0-generic", True),
+        ("Linux version 4.4.0 #1 SMP Sun Jan 10 15:06:54 PST 2016", "4.4.0", None, True),
+        ("Linux version 6.8.0-generic (buildd@host) (gcc 13) #1 SMP", "6.8.0-generic",
+         "6.8.0-generic", False),
+        # A gVisor-looking banner on the host's own kernel release is not gVisor.
+        ("Linux version 4.4.0 #1 SMP Sun Jan 10 15:06:54 PST 2016", "4.4.0", "4.4.0", False),
+    ],
+)  # fmt: skip
+def test_gvisor_kernel_check(monkeypatch, tmp_path, version, release, host, ok):
+    proc_version = tmp_path / "version"
+    proc_version.write_text(version + "\n", encoding="utf-8")
+    real_path = selftest.Path
+    monkeypatch.setattr(
+        selftest, "Path", lambda p: proc_version if p == "/proc/version" else real_path(p)
+    )
+    monkeypatch.setattr(
+        selftest.os, "uname", lambda: type("Uname", (), {"release": release})(), raising=False
+    )
+    result, detail = selftest._gvisor_kernel(_runtime_args(host_kernel=host))
+    assert result is ok and version in detail
+    assert (f"host: {host}" in detail) is (host is not None)
+
+
+def test_gvisor_kernel_check_is_skipped_under_runc():
+    ok, detail = selftest._gvisor_kernel(_runtime_args(runtime="runc"))
+    assert ok is None and "runc" in detail
+
+
+class _Statvfs:
+    def __init__(self, read_only):
+        self.f_flag = 1 if read_only else 0
+
+
+@pytest.mark.parametrize(
+    ("error", "read_only", "ok"),
+    [
+        (errno.EROFS, False, True),
+        (errno.EACCES, True, True),  # gVisor: permissions are checked first
+        (errno.EACCES, False, False),
+        (None, True, False),
+    ],
+)
+def test_read_only_root_check(monkeypatch, tmp_path, error, read_only, ok):
+    monkeypatch.setattr(selftest.os, "statvfs", lambda path: _Statvfs(read_only), raising=False)
+    monkeypatch.setattr(selftest.os, "ST_RDONLY", 1, raising=False)
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if error is not None:
+            raise OSError(error, os.strerror(error))
+        return open(tmp_path / "written", mode, *args, **kwargs)
+
+    monkeypatch.setattr(selftest, "open", fake_open, raising=False)
+    assert selftest._read_only_root(None)[0] is ok
