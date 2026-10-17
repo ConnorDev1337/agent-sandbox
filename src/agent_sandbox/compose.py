@@ -15,6 +15,18 @@ PACKAGE_DIR = Path(__file__).parent
 SECCOMP_PROFILE = PACKAGE_DIR / "docker" / "seccomp" / "agent.json"
 PROXY_PORT = 3128
 AGENT_HOME = "/home/agent"
+GATEWAY_CA_DIR = "/var/lib/agent-sandbox/ca"
+GATEWAY_TLS_DIR = "/sandbox-tls"
+AGENT_TLS_DIR = "/etc/agent-sandbox/tls"
+# Variables that point the usual clients at the bundle with the sandbox CA.
+# NODE_EXTRA_CA_CERTS adds to Node's built-in roots, so it gets the CA alone.
+CA_BUNDLE_VARIABLES = (
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "PIP_CERT",
+)
 
 # Host-executed files inside the workspace. The agent must not be able to plant
 # code that runs on the host later (git hooks, core.hooksPath/core.fsmonitor).
@@ -39,6 +51,10 @@ def build(config: SandboxConfig) -> dict[str, Any]:
         "NODE_USE_ENV_PROXY": "1",
         **config.env_set,
     }
+    if config.tls_inspect:
+        for name in CA_BUNDLE_VARIABLES:
+            environment[name] = f"{AGENT_TLS_DIR}/ca-bundle.crt"
+        environment["NODE_EXTRA_CA_CERTS"] = f"{AGENT_TLS_DIR}/ca.crt"
     for name in config.env_pass:
         environment[name] = None  # Compose takes the value from the invoking shell
 
@@ -109,6 +125,18 @@ def build(config: SandboxConfig) -> dict[str, Any]:
         ],
         "networks": {"sandbox": {"ipv4_address": config.agent_ip}},
     }
+    volumes: dict[str, Any] = {"home": {}}
+    if config.tls_inspect:
+        # The CA key never leaves the gateway; the agent mounts only the
+        # published certificates, read-only, so its root filesystem stays read-only.
+        gateway["volumes"] += [
+            {"type": "volume", "source": "ca", "target": GATEWAY_CA_DIR},
+            {"type": "volume", "source": "tls", "target": GATEWAY_TLS_DIR},
+        ]
+        agent["volumes"].append(
+            {"type": "volume", "source": "tls", "target": AGENT_TLS_DIR, "read_only": True}
+        )
+        volumes.update({"ca": {}, "tls": {}})
     return {
         "name": config.project,
         "services": {"gateway": gateway, "agent": agent},
@@ -122,7 +150,7 @@ def build(config: SandboxConfig) -> dict[str, Any]:
             },
             "egress": {},
         },
-        "volumes": {"home": {}},
+        "volumes": volumes,
     }
 
 
