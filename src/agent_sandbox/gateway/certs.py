@@ -72,6 +72,17 @@ def find_openssl() -> str:
     return path
 
 
+def openssl_version(openssl: str) -> str:
+    """Return the version line of ``openssl``: ``OpenSSL 3.0.15 ...``, ``LibreSSL 3.3.6``..."""
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv
+            [openssl, "version"], check=True, capture_output=True, timeout=OPENSSL_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CertificateError(f"cannot run {openssl}: {exc}") from None
+    return result.stdout.decode(errors="replace").strip()
+
+
 def _ec_key_args(path: Path) -> list[str]:
     return ["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-param_enc",
             "named_curve", "-out", str(path)]  # fmt: skip

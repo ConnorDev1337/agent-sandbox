@@ -54,6 +54,7 @@ async def _run(args: argparse.Namespace) -> None:
         log.event(
             "tls.inspection_enabled",
             ca_fingerprint=issuer.ca.fingerprint(),
+            openssl=certs.openssl_version(issuer.ca.openssl),
             passthrough=[rule.target for rule in allowlist.rules if not rule.inspect],
         )
 
