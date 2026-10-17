@@ -196,5 +196,5 @@ def test_config_and_help(capsys, workspace):
     code, out, _ = run(capsys, workspace, "config")
     payload = json.loads(out)
     assert code == 0 and payload["gateway_ip"] == "172.31.250.2"
-    assert payload["tls_inspect"] is False
+    assert payload["tls_inspect"] is False and payload["undecodable_bodies"] == "allow"
     assert cli.main([]) == 2
