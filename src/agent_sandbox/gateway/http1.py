@@ -1,8 +1,9 @@
 """HTTP/1.x request parsing for traffic the gateway can read.
 
 The gateway forwards what it parsed, so parsing is strict: anything two HTTP
-implementations could frame differently (bare CR or LF, whitespace before a
-colon, both Content-Length and Transfer-Encoding, odd chunk sizes) is refused
+implementations could frame differently (bare CR or LF, control characters,
+whitespace before a colon, both Content-Length and Transfer-Encoding, framing
+values other than digits or exactly ``chunked``, odd chunk sizes) is refused
 instead of being guessed at.
 """
 
@@ -14,11 +15,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 MAX_HEAD = 64 * 1024
-_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-_VERSION = re.compile(r"^HTTP/1\.[01]$")
-_CHUNK_SIZE = re.compile(rb"^[0-9A-Fa-f]{1,16}$")
+_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_VERSION = re.compile(r"HTTP/1\.[01]")
+# Visible ASCII but "#": no whitespace, control characters, fragment or raw
+# non-ASCII bytes (which servers may decode differently, e.g. as overlong UTF-8).
+_TARGET = re.compile(r"[\x21\x22\x24-\x7e]+")
+_FIELD_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")  # control characters but HTAB
+_LENGTH = re.compile(r"[0-9]{1,18}")
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}")
 _METHOD = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-_MAX_METHOD = 24
+# Whitespace that lenient servers skip before a request line, and accept after
+# the method (the first four), as RFC 9112 (section 3) allows.
+_LENIENT_SPACE = b" \t\x0b\x0c\r\n"
 # Proxy-only headers that must not travel past the gateway.
 _PROXY_HEADERS = frozenset({"proxy-authorization", "proxy-connection"})
 # The start of the HTTP/2 connection preface (RFC 9113, section 3.4), as read
@@ -45,15 +53,21 @@ class ProxyError(Exception):
 def request_start(data: bytes) -> bool | None:
     """Tell whether a byte stream starts like an HTTP/1 request line.
 
-    Returns ``None`` while ``data`` could still be the start of a method, so a
-    request line split over several reads is not mistaken for another protocol.
+    The answer errs towards a request: whatever a lenient server could read as
+    one (after leading whitespace or empty lines, with other whitespace than a
+    space after the method, with a long method) is then parsed, and refused by
+    the strict parser, instead of being relayed unparsed. Returns ``None``
+    while ``data`` could still be the start of a method, so the answer does not
+    depend on how the stream was split into reads.
     """
+    if data[:1] and data[0] in _LENIENT_SPACE:
+        return True
     match = _METHOD.match(data)
     if match is None:
         return False
     if match.end() == len(data):
-        return None if len(data) < _MAX_METHOD else False
-    return data[match.end()] == ord(" ")
+        return None if len(data) < MAX_HEAD else True
+    return data[match.end()] in _LENIENT_SPACE[:4]
 
 
 @dataclass
@@ -74,24 +88,26 @@ class Request:
 
 
 def parse_head(head: bytes) -> Request:
-    """Parse a request head that ends with an empty line."""
-    try:
-        text = head.decode("iso-8859-1")
-        lines = text.split("\r\n")
-        method, target, version = lines[0].split(" ", 2)
-    except (UnicodeDecodeError, ValueError):
-        raise ProxyError(400, "malformed request line") from None
+    """Parse a request head that ends with its first empty line."""
+    lines = head.decode("iso-8859-1").split("\r\n")
     if any("\r" in line or "\n" in line or "\0" in line for line in lines):
         raise ProxyError(400, "bare CR, LF or NUL in request head")
-    if not _TOKEN.match(method) or not target or " " in target or not _VERSION.match(version):
+    if len(lines) < 3 or lines[-2:] != ["", ""] or "" in lines[:-2]:
+        raise ProxyError(400, "malformed request head")
+    parts = lines[0].split(" ")
+    if len(parts) != 3:
+        raise ProxyError(400, "malformed request line")
+    method, target, version = parts
+    valid = _TOKEN.fullmatch(method) and _TARGET.fullmatch(target) and _VERSION.fullmatch(version)
+    if not valid:
         raise ProxyError(400, "malformed request line")
     headers = []
-    for line in lines[1:]:
-        if not line:
-            continue
+    for line in lines[1:-2]:
         name, sep, value = line.partition(":")
-        if not sep or not _TOKEN.match(name):
+        if not sep or not _TOKEN.fullmatch(name):
             raise ProxyError(400, "malformed header")
+        if _FIELD_CONTROL.search(value):
+            raise ProxyError(400, "control character in header value")
         headers.append((name, value.strip(" \t")))
     return Request(method.upper(), target, version, headers, head)
 
@@ -103,22 +119,28 @@ def body_length(request: Request) -> int | None:
     if encodings:
         if lengths:
             raise ProxyError(400, "both Transfer-Encoding and Content-Length")
-        if len(encodings) != 1 or encodings[0].strip().lower() != "chunked":
+        if request.version == "HTTP/1.0":
+            # Such framing is faulty (RFC 9112, section 6.1): servers may ignore it.
+            raise ProxyError(400, "Transfer-Encoding in an HTTP/1.0 request")
+        # Values are stripped of SP and HTAB only: with anything else around it,
+        # a server might not recognize the coding as chunked.
+        if len(encodings) != 1 or encodings[0].lower() != "chunked":
             raise ProxyError(501, "unsupported Transfer-Encoding")
         return None
     if not lengths:
         return 0
-    values = {value.strip() for value in lengths}
+    values = set(lengths)
     value = values.pop()
-    if values or not value.isdigit() or len(value) > 18:
+    if values or not _LENGTH.fullmatch(value):
         raise ProxyError(400, "invalid Content-Length")
     return int(value)
 
 
 def chunk_size(line: bytes) -> int:
-    """Parse a chunk-size line (extensions ignored)."""
-    size = line.rstrip(b"\r\n").split(b";", 1)[0].strip(b" \t")
-    if not _CHUNK_SIZE.match(size):
+    """Parse a chunk-size line ending with CRLF (extensions ignored)."""
+    content = line.removesuffix(b"\r\n")
+    size = content.split(b";", 1)[0].strip(b" \t")
+    if b"\r" in content or b"\n" in content or not _CHUNK_SIZE.fullmatch(size):
         raise ProxyError(400, "malformed chunked body")
     return int(size, 16)
 
