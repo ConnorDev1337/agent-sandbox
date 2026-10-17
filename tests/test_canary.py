@@ -229,8 +229,9 @@ def test_stream_scanner_finds_a_wrapped_canary_split_across_pieces(canaries, mat
         lambda s: _wrap("".join(f"%{b:02X}" for b in s.encode().hex().encode()), 4, "\r\n"),
         lambda s: (" " * 8).join(s),
         lambda s: "=\r\n= \n".join(s),
+        lambda s: "".join(f"%{b:02X}%0A%20" for b in s.encode()),
     ],
-    ids=["percent-hex-wrapped", "padded", "soft-breaks"],
+    ids=["percent-hex-wrapped", "padded", "soft-breaks", "padded-percent"],
 )
 def test_stream_scanner_holds_back_padded_canaries(canaries, matcher, encode):
     secret = _secret(canaries, "aws", 1)
@@ -239,8 +240,10 @@ def test_stream_scanner_holds_back_padded_canaries(canaries, matcher, encode):
     for cut in range(1, len(data), 7):
         scanner = StreamScanner(matcher)
         released, hits = scanner.feed(data[:cut])
-        assert hits == [] and matcher.scan(released) == []
-        assert scanner.feed(data[cut:])[1][0].kind == "aws", cut
+        if not hits:  # Unless the first piece holds all of it
+            assert matcher.scan(released) == []
+            hits = scanner.feed(data[cut:])[1]
+        assert hits[0].kind == "aws", cut
 
 
 def test_stream_scanner_releases_everything_eventually(matcher):

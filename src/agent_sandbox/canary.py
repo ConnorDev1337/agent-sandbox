@@ -296,15 +296,18 @@ class StreamScanner:
 
     The last bytes are held back until more data (or the end of the stream)
     arrives: as many as it takes to leave ``span - 1`` once whitespace and soft
-    line breaks are removed, so a canary split across pieces is caught before
-    any part of it is released, however it is wrapped or padded, as long as it
-    spans at most MAX_HOLD bytes.
+    line breaks are removed, and the longest needle once percent-decoded too,
+    so a canary split across pieces is caught before any part of it is
+    released, however it is wrapped or padded (with whitespace as is or
+    percent-encoded), as long as it spans at most MAX_HOLD bytes.
     """
 
     def __init__(self, matcher: CanaryMatcher) -> None:
         self._matcher = matcher
-        # One more than the span needs: a soft line break may end in the next piece.
+        # A little more than needed: a soft line break or an escape may end in
+        # the next piece, and is then counted as more bytes than it decodes to.
         self._hold = matcher.span
+        self._decoded_hold = matcher.longest + 3 if matcher.longest else 0
         self._tail = b""
 
     def feed(self, data: bytes) -> tuple[bytes, list[CanaryHit]]:
@@ -322,13 +325,19 @@ class StreamScanner:
         limit = min(MAX_HOLD, len(window))
 
         def enough(size: int) -> bool:
-            return len(_normalize(window[-size:])) >= self._hold
+            tail = _normalize(window[-size:])
+            if len(tail) < self._hold:
+                return False
+            return b"%" not in tail or (
+                len(_normalize(unquote_to_bytes(tail))) >= self._decoded_hold
+            )
 
         size = min(self._hold, limit)
         if not size or enough(size):
             return size
-        # The normalized length grows with the size: search exponentially, then
-        # by bisection, so that data without whitespace costs one normalization.
+        # Normalized lengths grow with the size: search exponentially, then by
+        # bisection (which only ever returns a size that is enough), so that
+        # data without whitespace or escapes costs one normalization.
         low, high = size + 1, min(2 * size, limit)
         while not enough(high):
             if high == limit:
