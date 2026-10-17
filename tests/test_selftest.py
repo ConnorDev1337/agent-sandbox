@@ -24,6 +24,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def do_DELETE(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = b"agent-sandbox gateway: blocked: DELETE / is not allowed"
+        self.send_response(403)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 @pytest.fixture
 def server(monkeypatch):
@@ -77,6 +85,70 @@ def test_main_prints_json_lines_and_fails_on_errors(monkeypatch, capsys):
     ]
     monkeypatch.setattr(selftest, "CHECKS", [("good", lambda a: (True, "ok"))])
     assert selftest.main(["--allowed-host", "pypi.org"]) == 0
+
+
+def _args(**values):
+    defaults = {
+        "allowed_host": "pypi.org",
+        "tls_inspect": False,
+        "restricted_host": None,
+        "forbidden_method": "DELETE",
+    }
+    return type("Args", (), {**defaults, **values})()
+
+
+def test_tls_checks_are_skipped_without_inspection():
+    for check in (selftest._tls_intercepted, selftest._ca_bundle, selftest._https_exfiltration):
+        ok, detail = check(_args())
+        assert ok is None and "TLS inspection is off" in detail
+    assert selftest._forbidden_method(_args())[0] is None
+
+
+def test_forbidden_method_check(server):
+    ok, detail = selftest._forbidden_method(_args(restricted_host=server))
+    assert ok and "DELETE" in detail and "403" in detail
+    ok, _ = selftest._forbidden_method(_args(restricted_host=server, forbidden_method="GET"))
+    assert not ok  # a 200 from upstream means the rule was not enforced
+
+
+def test_tls_checks_with_inspection(tmp_path, monkeypatch):
+    monkeypatch.setattr(selftest, "_peer_issuer", lambda host: "agent-sandbox")
+    assert selftest._tls_intercepted(_args(tls_inspect=True))[0] is True
+    monkeypatch.setattr(selftest, "_peer_issuer", lambda host: "Let's Encrypt")
+    assert selftest._tls_intercepted(_args(tls_inspect=True))[0] is False
+
+    monkeypatch.setattr(selftest.Path, "home", lambda: tmp_path)
+    assert selftest._https_exfiltration(_args(tls_inspect=True))[0] is False  # no canary
+    (tmp_path / ".aws").mkdir()
+    (tmp_path / ".aws" / "credentials").write_text(
+        "aws_secret_access_key = abc123SECRET\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(selftest, "_fetch", lambda url, data=None: (403, "blocked: canary"))
+    assert selftest._https_exfiltration(_args(tls_inspect=True))[0] is True
+
+
+def test_ca_bundle_check_detects_writable_dirs_and_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.crt"))
+    assert selftest._ca_bundle(_args(tls_inspect=True))[0] is False
+    bundle = tmp_path / "ca-bundle.crt"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="ascii")
+    (tmp_path / "ca.key").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="ascii")
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    ok, detail = selftest._ca_bundle(_args(tls_inspect=True))
+    assert ok is False and "writable" in detail and "ca.key" in detail
+
+
+def test_peer_issuer_needs_a_proxy(monkeypatch):
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    with pytest.raises(RuntimeError, match="HTTPS_PROXY"):
+        selftest._peer_issuer("pypi.org")
+
+
+def test_skipped_checks_do_not_fail(monkeypatch, capsys):
+    monkeypatch.setattr(selftest, "CHECKS", [("off", lambda a: (None, "not enabled"))])
+    assert selftest.main(["--tls-inspect", "--restricted-host", "github.com"]) == 0
+    row = json.loads(capsys.readouterr().out)
+    assert row == {"check": "off", "ok": True, "detail": "not enabled", "skipped": True}
 
 
 def test_every_syscall_has_both_architectures():
