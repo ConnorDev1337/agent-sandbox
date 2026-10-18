@@ -86,7 +86,7 @@ skipped).
 Requirements: Docker Engine or Docker Desktop with Compose v2, Python 3.11+.
 
 ```bash
-pip install git+https://gitlab.com/connorhack/tools/agent-sandbox.git   # or: pip install -e . from a clone
+pip install git+https://github.com/ConnorDev1337/agent-sandbox.git   # or: pip install -e . from a clone
 cd ~/code/my-project
 agent-sandbox init --write-config     # canaries + .agent-sandbox.toml (no secrets in it)
 agent-sandbox up --build              # build images, start gateway + agent
@@ -142,9 +142,9 @@ The sandbox is the last line. [`examples/defense-in-depth/`](examples/defense-in
 is a scripted, reproducible demo of one prompt-injection attack (a poisoned MCP tool
 description and an attacker-written ticket that tell the agent to send `~/.aws/credentials` to
 an attacker's host) and of how three layers catch it independently:
-[mcp-security-scanner](https://gitlab.com/connorhack/tools/mcp-security-scanner) flags the
+[mcp-security-scanner](https://github.com/ConnorDev1337/mcp-security-scanner) flags the
 poisoned definitions before the server is connected;
-[tool-call-guard](https://gitlab.com/connorhack/tools/tool-call-guard), driven through Claude
+[tool-call-guard](https://github.com/ConnorDev1337/tool-call-guard), driven through Claude
 Code's real hook protocol, blocks the send and holds the shell command for an out-of-band
 approval; and, with the guard bypassed, the sandbox raises the canary tripwire, refuses the
 attacker's host and blocks the canary sent to an allowlisted host over inspected HTTPS.

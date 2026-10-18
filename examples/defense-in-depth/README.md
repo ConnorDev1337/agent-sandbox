@@ -5,8 +5,8 @@ and how three tools catch it **independently**:
 
 | Layer | Tool | Where it acts | When |
 |---|---|---|---|
-| 1 | [mcp-security-scanner](https://gitlab.com/connorhack/tools/mcp-security-scanner) | MCP configuration and tool definitions | Before the agent connects a server |
-| 2 | [tool-call-guard](https://gitlab.com/connorhack/tools/tool-call-guard) | Every tool call, through Claude Code's hooks | While the agent works |
+| 1 | [mcp-security-scanner](https://github.com/ConnorDev1337/mcp-security-scanner) | MCP configuration and tool definitions | Before the agent connects a server |
+| 2 | [tool-call-guard](https://github.com/ConnorDev1337/tool-call-guard) | Every tool call, through Claude Code's hooks | While the agent works |
 | 3 | agent-sandbox (this repository) | The container's file system and network | At run time, whatever the agent does |
 
 No model and no credentials are involved: the agent is a script that replays a fixed
