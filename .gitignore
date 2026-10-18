@@ -21,3 +21,6 @@ htmlcov/
 
 # Output of examples/defense-in-depth/demo.py (evidence, sandbox state)
 .demo-output/
+
+# Local agent conventions, not published
+CLAUDE.md
