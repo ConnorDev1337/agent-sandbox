@@ -1,4 +1,4 @@
-# agent-sandbox
+# Agent Sandbox
 
 A hardened Docker sandbox for coding agents. The agent gets a container with no capabilities, a
 tightened seccomp profile and a read-only root filesystem; its only way out is a gateway that
