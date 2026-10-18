@@ -1,6 +1,6 @@
 # Egress gateway: allowlist proxy, DNS sinkhole and canary tripwires.
 # Build context: the agent_sandbox package directory.
-FROM python:3.13-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+FROM python:3.14-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83
 
 # openssl mints the per-sandbox CA and leaf certificates for TLS inspection.
 # The base image already ships it (ca-certificates depends on it); installing
